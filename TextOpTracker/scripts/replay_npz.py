@@ -68,7 +68,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     # Define simulation stepping
     sim_dt = sim.get_physics_dt()
 
-    motion_file = str(Path("./artifacts") / Path(args_cli.motion_file) / "motion.npz")
+    motion_file = str(Path(args_cli.motion_file) / "motion.npz")
 
     motion = MotionLoader(
         motion_file,

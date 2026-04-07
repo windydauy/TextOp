@@ -122,9 +122,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # env_cfg.commands.motion.motion_file = str(Path("./artifacts") / Path(args_cli.motion_file) / "motion.npz")
         # env_cfg, agent_cfg = load_config(resume_path)
 
-        motion_files = glob.glob(str(Path("./artifacts") / Path(args_cli.motion_file) / "motion.npz"))
+        motion_files = glob.glob(str( Path(args_cli.motion_file) / "motion.npz"))
         if not motion_files:
-            raise FileNotFoundError(f"No motion.npz found in {Path('./artifacts') / Path(args_cli.motion_file)}")
+            raise FileNotFoundError(f"No motion.npz found in { Path(args_cli.motion_file)}")
         env_cfg.commands.motion.motion_files = motion_files  # List[str]
 
         print(f"[INFO]: Using motion file from CLI: {args_cli.motion_file}")

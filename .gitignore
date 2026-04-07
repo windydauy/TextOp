@@ -192,5 +192,12 @@ _build
 *.pkl
 *.zarr
 *.npz
-
+*.sh
+kimomotion_dataset/*
+TextOp-Data/*
 artifacts/
+TextOpTracker/artifacts/*
+TextOpTracker/logs/*
+TextOpTracker/outputs/*
+TextOpTracker/recordings/*
+TextOpTracker_partial/*

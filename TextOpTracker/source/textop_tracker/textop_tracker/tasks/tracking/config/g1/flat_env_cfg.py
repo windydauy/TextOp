@@ -2,7 +2,7 @@ from isaaclab.utils import configclass
 
 from textop_tracker.robots.g1 import G1_ACTION_SCALE, G1_CYLINDER_CFG
 from textop_tracker.tasks.tracking.config.g1.agents.rsl_rl_ppo_cfg import LOW_FREQ_SCALE
-from textop_tracker.tasks.tracking.tracking_env_cfg import TrackingEnvCfg, PrivPrivObservationsCfg, PropPropObservationsCfg, NoisePrivObservationsCfg, ProjGravObservationsCfg
+from textop_tracker.tasks.tracking.tracking_env_cfg import TrackingEnvCfg, PrivPrivObservationsCfg, PropPropObservationsCfg, NoisePrivObservationsCfg, ProjGravObservationsCfg, ProjGravAnchorObsObservationsCfg
 
 
 @configclass
@@ -130,6 +130,11 @@ class G1FlatPrivPrivObsEnvCfg(G1FlatEnvCfg):
 @configclass
 class G1FlatNoisePrivObsEnvCfg(G1FlatEnvCfg):
     observations: NoisePrivObservationsCfg = NoisePrivObservationsCfg()
+
+
+@configclass
+class G1FlatProjGravAnchorObsEnvCfg(G1FlatEnvCfg):
+    observations: ProjGravAnchorObsObservationsCfg = ProjGravAnchorObsObservationsCfg()
 
 
 @configclass

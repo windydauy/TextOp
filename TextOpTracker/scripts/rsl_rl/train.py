@@ -84,9 +84,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.seed = agent_cfg.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
 
-    motion_files = glob.glob(str(Path("./artifacts") / Path(args_cli.motion_file) / "motion.npz"))
+    motion_files = glob.glob(str(Path(args_cli.motion_file) / "motion.npz"))
     if not motion_files:
-        raise FileNotFoundError(f"No motion.npz found in {Path('./artifacts') / Path(args_cli.motion_file)}")
+        raise FileNotFoundError(f"No motion.npz found in {Path(args_cli.motion_file)}")
     env_cfg.commands.motion.motion_files = motion_files  # List[str]
 
     # specify directory for logging experiments

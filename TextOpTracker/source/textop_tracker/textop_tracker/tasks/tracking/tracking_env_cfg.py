@@ -222,6 +222,100 @@ class ProjGravObservationsCfg:
     critic: PrivilegedCfg = PrivilegedCfg()
 
 
+# Bodies whose reference motion targets are added as EE observations.
+_EE_BODY_NAMES: list[str] = [
+    "left_wrist_yaw_link",
+    "right_wrist_yaw_link",
+    "left_ankle_roll_link",
+    "right_ankle_roll_link",
+]
+
+
+@configclass
+class ProjGravAnchorObsObservationsCfg:
+    """ProjGrav observations augmented with robot anchor state and EE motion targets."""
+
+    @configclass
+    class PolicyCfg(ObsGroup):
+        """Observations for policy group."""
+
+        command = ObsTerm(
+            func=mdp.generated_commands,
+            params={"command_name": "motion"},
+            noise=GaussianNoiseCfg(operation="add", mean=0.0, std=0.0),
+        )
+        motion_anchor_pos_b = ObsTerm(
+            func=mdp.motion_anchor_pos_b_future,
+            params={"command_name": "motion"},
+            noise=Unoise(n_min=-0.25, n_max=0.25),
+        )
+        motion_anchor_ori_b = ObsTerm(
+            func=mdp.motion_anchor_ori_b_future,
+            params={"command_name": "motion"},
+            noise=Unoise(n_min=-0.05, n_max=0.05),
+        )
+        robot_anchor_pos_w = ObsTerm(
+            func=mdp.robot_anchor_pos_w,
+            params={"command_name": "motion"},
+            noise=Unoise(n_min=-0.05, n_max=0.05),
+        )
+        robot_anchor_ori_w = ObsTerm(
+            func=mdp.robot_anchor_ori_w,
+            params={"command_name": "motion"},
+            noise=Unoise(n_min=-0.05, n_max=0.05),
+        )
+        # motion_ee_pos_b = ObsTerm(
+        #     func=mdp.motion_body_pos_b_future,
+        #     params={"command_name": "motion", "body_names": _EE_BODY_NAMES},
+        #     noise=Unoise(n_min=-0.1, n_max=0.1),
+        # )
+        # motion_ee_ori_b = ObsTerm(
+        #     func=mdp.motion_body_ori_b_future,
+        #     params={"command_name": "motion", "body_names": _EE_BODY_NAMES},
+        #     noise=Unoise(n_min=-0.05, n_max=0.05),
+        # )
+        projected_gravity = ObsTerm(func=mdp.projected_gravity, noise=Unoise(n_min=-0.07, n_max=0.07))
+        base_lin_vel = ObsTerm(func=mdp.base_lin_vel, noise=Unoise(n_min=-0.5, n_max=0.5))
+        base_ang_vel = ObsTerm(func=mdp.base_ang_vel, noise=Unoise(n_min=-0.2, n_max=0.2))
+        joint_pos = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
+        joint_vel = ObsTerm(func=mdp.joint_vel_rel, noise=Unoise(n_min=-0.5, n_max=0.5))
+        actions = ObsTerm(func=mdp.last_action)
+
+        def __post_init__(self):
+            self.enable_corruption = True
+            self.concatenate_terms = True
+
+    @configclass
+    class PrivilegedCfg(ObsGroup):
+        command = ObsTerm(func=mdp.generated_commands, params={"command_name": "motion"})
+        motion_anchor_pos_b = ObsTerm(func=mdp.motion_anchor_pos_b_future, params={"command_name": "motion"})
+        motion_anchor_ori_b = ObsTerm(func=mdp.motion_anchor_ori_b_future, params={"command_name": "motion"})
+        robot_anchor_pos_w = ObsTerm(
+            func=mdp.robot_anchor_pos_w,
+            params={"command_name": "motion"},
+        )
+        robot_anchor_ori_w = ObsTerm(
+            func=mdp.robot_anchor_ori_w,
+            params={"command_name": "motion"},
+        )
+        projected_gravity = ObsTerm(func=mdp.projected_gravity, noise=Unoise(n_min=-0.07, n_max=0.07))
+        body_pos = ObsTerm(func=mdp.robot_body_pos_b, params={"command_name": "motion"})
+        body_ori = ObsTerm(func=mdp.robot_body_ori_b, params={"command_name": "motion"})
+        base_lin_vel = ObsTerm(func=mdp.base_lin_vel)
+        base_ang_vel = ObsTerm(func=mdp.base_ang_vel)
+        joint_pos = ObsTerm(func=mdp.joint_pos_rel)
+        joint_vel = ObsTerm(func=mdp.joint_vel_rel)
+        actions = ObsTerm(func=mdp.last_action)
+
+        def __post_init__(self):
+            self.enable_corruption = True
+            self.concatenate_terms = True
+
+    # observation groups
+    policy: PolicyCfg = PolicyCfg()
+    critic: PrivilegedCfg = PrivilegedCfg()
+
+
 @configclass
 class PropPropObservationsCfg:
     """Observation specifications for the MDP."""

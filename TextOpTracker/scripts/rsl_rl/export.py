@@ -84,9 +84,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         assert args_cli.motion_file is not None, "Motion file is required when resume_path is provided"
         resume_path = args_cli.resume_path
 
-        motion_files = glob.glob(str(Path("./artifacts") / Path(args_cli.motion_file) / "motion.npz"))
+        motion_files = glob.glob(str(Path(args_cli.motion_file) / "motion.npz"))
         if not motion_files:
-            raise FileNotFoundError(f"No motion.npz found in {Path('./artifacts') / Path(args_cli.motion_file)}")
+            raise FileNotFoundError(f"No motion.npz found in {Path(args_cli.motion_file)}")
         # Only set motion_files if env_cfg has commands attribute (ManagerBasedRLEnvCfg)
         if isinstance(env_cfg, ManagerBasedRLEnvCfg):
             env_cfg.commands.motion.motion_files = motion_files  # List[str]

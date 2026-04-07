@@ -514,6 +514,40 @@ class MotionCommand(CommandTerm):
             # breakpoint()
             return future_quat.view(self.num_envs, -1)
 
+    def future_body_pos_quat_w(
+        self, body_indexes: Sequence[int]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """World-frame reference body poses at future buffer steps (same horizon as ``motion_anchor_pos``).
+
+        Returns:
+            pos_w: (num_envs, future_steps, n_bodies, 3)
+            quat_w: (num_envs, future_steps, n_bodies, 4)
+        """
+        env = torch.arange(self.num_envs, device=self.device)
+        bi = torch.tensor(list(body_indexes), dtype=torch.long, device=self.device)
+
+        if self.cfg.future_steps <= 1:
+            buffer_indices = torch.clamp(
+                self.time_steps - self.buffer_start_time, 0, self.buffer_length - 1
+            )
+            pos = self.body_pos_w_buffer[env, buffer_indices][:, bi, :]
+            pos = pos + self._env.scene.env_origins[:, None, :]
+            quat = self.body_quat_w_buffer[env, buffer_indices][:, bi, :]
+            return pos[:, None, :, :], quat[:, None, :, :]
+
+        current_indices = torch.clamp(
+            self.time_steps - self.buffer_start_time, 0, self.buffer_length - 1
+        )
+        future_indices = current_indices[:, None] + torch.arange(
+            self.cfg.future_steps, device=self.device
+        )[None, :]
+        future_indices = torch.clamp(future_indices, 0, self.buffer_length - 1)
+        chunk_pos = self.body_pos_w_buffer[env[:, None], future_indices]
+        chunk_quat = self.body_quat_w_buffer[env[:, None], future_indices]
+        pos = chunk_pos[:, :, bi, :] + self._env.scene.env_origins[:, None, None, :]
+        quat = chunk_quat[:, :, bi, :]
+        return pos, quat
+
     @property
     def robot_joint_pos(self) -> torch.Tensor:
         return self.robot.data.joint_pos
