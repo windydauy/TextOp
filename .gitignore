@@ -1,5 +1,5 @@
-TextOpTracker/source/textop_tracker/textop_tracker/assets/unitree_description
-TextOpDeploy/src/unitree_mujoco/unitree_robots
+# TextOpTracker/source/textop_tracker/textop_tracker/assets/unitree_description
+# TextOpDeploy/src/unitree_mujoco/unitree_robots
 
 
 *.json
