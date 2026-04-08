@@ -56,10 +56,10 @@ parser.add_argument(
     type=str,
     default="auto",
     help=(
-        "Scale factor applied to root translation columns (root_translateX/Y/Z). "
-        "'auto' infers from magnitude: if max |pos| > 10 the data is treated as "
-        "centimetres and divided by 100. Pass a float (e.g. '0.01') to force "
-        "cm→m, or '1.0' to disable any scaling."
+        "Input unit scale for root translation columns (root_translateX/Y/Z): "
+        "'1.0' means the CSV translation is already in metres, '100.0' means "
+        "the CSV translation is in centimetres (the script divides by 100). "
+        "'auto' infers by magnitude."
     ),
 )
 
@@ -112,7 +112,7 @@ def _frame_slice(frame_range: tuple[int, int] | None, total_frames: int) -> slic
 
 
 def _apply_translate_scale(base_pos: np.ndarray, translate_scale: str) -> np.ndarray:
-    """Scale root translations, with optional auto-detection of cm→m conversion."""
+    """Convert root translation to metres."""
     if translate_scale == "auto":
         max_abs = float(np.max(np.abs(base_pos)))
         if max_abs > 10.0:
@@ -128,11 +128,15 @@ def _apply_translate_scale(base_pos: np.ndarray, translate_scale: str) -> np.nda
             )
             return base_pos
     else:
-        scale = float(translate_scale)
-        if scale != 1.0:
-            print(f"[INFO] translate_scale={scale}: multiplying root translations by {scale}.")
-            return (base_pos * scale).astype(np.float32, copy=False)
-        return base_pos
+        unit_scale = float(translate_scale)
+        if unit_scale <= 0:
+            raise ValueError(f"translate_scale must be > 0, got {unit_scale}.")
+        if unit_scale != 1.0:
+            print(
+                f"[INFO] translate_scale={unit_scale}: interpreting CSV translation unit as 1/{unit_scale} metre, "
+                f"dividing by {unit_scale} to convert to metres."
+            )
+        return (base_pos / unit_scale).astype(np.float32, copy=False)
 
 
 def _convert_header_csv_to_motion_array(
