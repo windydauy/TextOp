@@ -55,7 +55,21 @@ from isaaclab.envs import (
     multi_agent_to_single_agent,
 )
 from isaaclab.utils.dict import print_dict
-from isaaclab.utils.io import dump_pickle, dump_yaml
+try:
+    from isaaclab.utils.io import dump_pickle, dump_yaml
+except ImportError:
+    import pickle
+    import yaml
+    def dump_pickle(filename, data):
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
+        with open(filename, "wb") as f:
+            pickle.dump(data, f)
+
+    def dump_yaml(filename, data, sort_keys=False):
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
+        with open(filename, "w", encoding="utf-8") as f:
+            yaml.safe_dump(data, f, sort_keys=sort_keys, allow_unicode=True)
+from isaaclab.utils.io import dump_yaml
 from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config

@@ -20,8 +20,13 @@ parser.add_argument(
 )
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
+parser.add_argument(
+    "--agent", type=str, default="rsl_rl_cfg_entry_point", help="Name of the RL agent configuration entry point."
+)
 parser.add_argument("--resume_path", type=str, default=None, help="Path to the resume checkpoint.")
 parser.add_argument("--motion_file", type=str, default=None, help="Path to the motion file.")
+parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment.")
+parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -42,6 +47,8 @@ simulation_app = app_launcher.app
 import gymnasium as gym
 import os
 import pathlib
+import pickle
+import time
 import torch
 
 from rsl_rl.runners import OnPolicyRunner
@@ -61,7 +68,14 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 # Import extensions to set up environment tasks
 import textop_tracker.tasks  # noqa: F401
 from textop_tracker.utils.exporter import attach_onnx_metadata, export_motion_policy_as_onnx
-from isaaclab.utils.io.pkl import load_pickle
+try:
+    # Isaac Lab 2.1.x
+    from isaaclab.utils.io.pkl import load_pickle
+except ImportError:
+    # Isaac Lab 2.3.x: removed load_pickle, use local fallback.
+    def load_pickle(file_path: str):
+        with open(file_path, "rb") as f:
+            return pickle.load(f)
 
 
 def load_config(resume_path: str) -> tuple[ManagerBasedRLEnvCfg, RslRlOnPolicyRunnerCfg]:
@@ -72,11 +86,53 @@ def load_config(resume_path: str) -> tuple[ManagerBasedRLEnvCfg, RslRlOnPolicyRu
     return env_cfg, agent_cfg
 
 
-@hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
+def _is_mapping_like(obj) -> bool:
+    return hasattr(obj, "keys") and hasattr(obj, "__getitem__")
+
+
+def _extract_policy_obs(obs_ret):
+    """Handle Isaac Lab 2.1/2.3 observation return formats."""
+    if isinstance(obs_ret, tuple) and len(obs_ret) == 2:
+        obs_ret = obs_ret[0]
+
+    if _is_mapping_like(obs_ret):
+        if "policy" in obs_ret:
+            return obs_ret["policy"]
+        for _, value in obs_ret.items():
+            return value
+
+    return obs_ret
+
+
+def _get_policy_module(runner):
+    """Handle runner internals across Isaac Lab / rsl_rl versions."""
+    if hasattr(runner.alg, "policy"):
+        return runner.alg.policy
+    if hasattr(runner.alg, "actor_critic"):
+        return runner.alg.actor_critic
+    raise AttributeError("Runner does not expose a policy module through alg.policy or alg.actor_critic.")
+
+
+def _get_policy_normalizer(runner, policy_module):
+    """Handle normalizer locations across Isaac Lab 2.1/2.3."""
+    if hasattr(policy_module, "actor_obs_normalizer"):
+        return policy_module.actor_obs_normalizer
+    if hasattr(policy_module, "student_obs_normalizer"):
+        return policy_module.student_obs_normalizer
+    if hasattr(runner, "obs_normalizer"):
+        return runner.obs_normalizer
+    return None
+
+
+@hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
     """Play with RSL-RL agent."""
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
+    if hasattr(env_cfg, "seed"):
+        env_cfg.seed = agent_cfg.seed
+    if hasattr(env_cfg, "sim") and hasattr(args_cli, "device") and args_cli.device is not None:
+        env_cfg.sim.device = args_cli.device
 
     # specify directory for logging experiments
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
@@ -137,7 +193,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
 
+    # convert to single-agent instance if required by the RL algorithm
+    if isinstance(env.unwrapped, DirectMARLEnv):
+        env = multi_agent_to_single_agent(env)
+
     log_dir = os.path.dirname(resume_path)
+    if hasattr(env_cfg, "log_dir"):
+        env_cfg.log_dir = log_dir
 
     # wrap for video recording
     if args_cli.video:
@@ -151,12 +213,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print_dict(video_kwargs, nesting=4)
         env = gym.wrappers.RecordVideo(env, **video_kwargs)
 
-    # convert to single-agent instance if required by the RL algorithm
-    if isinstance(env.unwrapped, DirectMARLEnv):
-        env = multi_agent_to_single_agent(env)
-
     # wrap around environment for rsl-rl
-    env = RslRlVecEnvWrapper(env)
+    clip_actions = getattr(agent_cfg, "clip_actions", None)
+    env = RslRlVecEnvWrapper(env, clip_actions=clip_actions)
 
     # load previously trained model
     ppo_runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
@@ -164,6 +223,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # obtain the trained policy for inference
     policy = ppo_runner.get_inference_policy(device=env.unwrapped.device)
+    policy_module = _get_policy_module(ppo_runner)
+    normalizer = _get_policy_normalizer(ppo_runner, policy_module)
 
     if EXPORT_ONNX:
         # export policy to onnx/jit
@@ -171,30 +232,38 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
         export_motion_policy_as_onnx(
             env.unwrapped,
-            ppo_runner.alg.policy,
-            normalizer=ppo_runner.obs_normalizer,
+            policy_module,
+            normalizer=normalizer,
             path=export_model_dir,
             filename="policy.onnx",
         )
         attach_onnx_metadata(env.unwrapped, args_cli.wandb_path if args_cli.wandb_path else "none", export_model_dir)
     # reset environment
-    obs, _ = env.get_observations()
+    obs = _extract_policy_obs(env.get_observations())
     timestep = 0
+    dt = getattr(env.unwrapped, "step_dt", None)
 
     print("Start playing...")
     # simulate environment
     while simulation_app.is_running():
+        start_time = time.time()
         # run everything in inference mode
         with torch.inference_mode():
             # agent stepping
             actions = policy(obs)
             # env stepping
-            obs, _, _, _ = env.step(actions)
+            obs_ret, _, _, _ = env.step(actions)
+            obs = _extract_policy_obs(obs_ret)
         if args_cli.video:
             timestep += 1
             # Exit the play loop after recording one video
             if timestep == args_cli.video_length:
                 break
+
+        if args_cli.real_time and dt is not None:
+            sleep_time = dt - (time.time() - start_time)
+            if sleep_time > 0:
+                time.sleep(sleep_time)
 
     # close the simulator
     env.close()

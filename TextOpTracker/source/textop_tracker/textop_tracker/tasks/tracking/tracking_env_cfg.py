@@ -668,7 +668,8 @@ class TrackingEnvCfg(ManagerBasedRLEnvCfg):
         self.sim.dt = 0.005
         self.sim.render_interval = self.decimation
         self.sim.physics_material = self.scene.terrain.physics_material
-        self.sim.physx.gpu_max_rigid_patch_count = 10 * 2**15
+        # Increase GPU rigid patch buffer to avoid PhysX patch buffer overflow in dense contact scenes.
+        self.sim.physx.gpu_max_rigid_patch_count = 20 * 2**15
         # viewer settings
         self.viewer.eye = (1.0, -2.0, 1.0)
         self.viewer.lookat = (0.0, 0.0, 0.8)

@@ -11,6 +11,8 @@ import time
 import torch
 from collections import deque
 
+import torch
+
 import rsl_rl
 from rsl_rl.algorithms import PPO, PPO_MNMLP, Distillation
 from rsl_rl.env import VecEnv
@@ -45,43 +47,47 @@ class OnPolicyRunner:
         else:
             raise ValueError(f"Training type not found for algorithm {self.alg_cfg['class_name']}.")
 
-        # resolve dimensions of observations
-        obs, extras = self.env.get_observations()
+        # ---------------------------------------------------------------------
+        # Isaac Lab 2.3 / new rsl_rl observation API compatibility
+        # - old API: obs, extras = env.get_observations()
+        # - new API: obs_dict / TensorDict = env.get_observations()
+        # ---------------------------------------------------------------------
+        obs_ret = self.env.get_observations()
+        obs_dict, extras = self._parse_obs_return(obs_ret)
+
+        obs = self._get_policy_obs(obs_dict)
         num_obs = obs.shape[1]
 
         # resolve type of privileged observations
         if self.training_type == "rl":
-            if "critic" in extras["observations"]:
-                self.privileged_obs_type = "critic"  # actor-critic reinforcement learnig, e.g., PPO
+            if self._has_obs_key(obs_dict, extras, "critic"):
+                self.privileged_obs_type = "critic"  # actor-critic reinforcement learning, e.g., PPO
             else:
                 self.privileged_obs_type = None
-        if self.training_type == "distillation":
-            if "teacher" in extras["observations"]:
+        elif self.training_type == "distillation":
+            if self._has_obs_key(obs_dict, extras, "teacher"):
                 self.privileged_obs_type = "teacher"  # policy distillation
             else:
                 self.privileged_obs_type = None
+        else:
+            self.privileged_obs_type = None
 
         # resolve dimensions of privileged observations
-        if self.privileged_obs_type is not None:
-            num_privileged_obs = extras["observations"][self.privileged_obs_type].shape[1]
-        else:
-            num_privileged_obs = num_obs
+        privileged_obs = self._get_privileged_obs(obs_dict, extras, self.privileged_obs_type, obs)
+        num_privileged_obs = privileged_obs.shape[1]
 
         # evaluate the policy class
         policy_class = eval(self.policy_cfg.pop("class_name"))
-        policy: ActorCritic | ActorCriticRecurrent | ActorCriticMNMLP | StudentTeacher | StudentTeacherRecurrent = policy_class(
-            num_obs, num_privileged_obs, self.env.num_actions, **self.policy_cfg
-        ).to(self.device)
+        policy: ActorCritic | ActorCriticRecurrent | ActorCriticMNMLP | StudentTeacher | StudentTeacherRecurrent = (
+            policy_class(num_obs, num_privileged_obs, self.env.num_actions, **self.policy_cfg).to(self.device)
+        )
 
         # resolve dimension of rnd gated state
         if "rnd_cfg" in self.alg_cfg and self.alg_cfg["rnd_cfg"] is not None:
-            # check if rnd gated state is present
-            rnd_state = extras["observations"].get("rnd_state")
+            rnd_state = self._get_obs_by_key(obs_dict, extras, "rnd_state")
             if rnd_state is None:
-                raise ValueError("Observations for the key 'rnd_state' not found in infos['observations'].")
-            # get dimension of rnd gated state
+                raise ValueError("Observations for the key 'rnd_state' not found in environment observations.")
             num_rnd_state = rnd_state.shape[1]
-            # add rnd gated state to config
             self.alg_cfg["rnd_cfg"]["num_states"] = num_rnd_state
             # scale down the rnd weight with timestep (similar to how rewards are scaled down in legged_gym envs)
             self.alg_cfg["rnd_cfg"]["weight"] *= env.unwrapped.step_dt
@@ -166,9 +172,16 @@ class OnPolicyRunner:
             )
 
         # start learning
-        obs, extras = self.env.get_observations()
-        privileged_obs = extras["observations"].get(self.privileged_obs_type, obs)
-        obs, privileged_obs = obs.to(self.device), privileged_obs.to(self.device)
+        obs_ret = self.env.get_observations()
+        obs_dict, extras = self._parse_obs_return(obs_ret)
+
+        obs = self._get_policy_obs(obs_dict).to(self.device)
+        privileged_obs = self._get_privileged_obs(obs_dict, extras, self.privileged_obs_type, obs).to(self.device)
+
+        # perform normalization on initial observations
+        obs = self.obs_normalizer(obs)
+        privileged_obs = self.privileged_obs_normalizer(privileged_obs)
+
         self.train_mode()  # switch to train mode (for dropout for example)
 
         # Book keeping
@@ -190,7 +203,7 @@ class OnPolicyRunner:
             print(f"Synchronizing parameters for rank {self.gpu_global_rank}...")
             self.alg.broadcast_parameters()
             # TODO: Do we need to synchronize empirical normalizers?
-            #   Right now: No, because they all should converge to the same values "asymptotically".
+            # Right now: No, because they all should converge to the same values "asymptotically".
 
         # Start training
         start_iter = self.current_learning_iteration
@@ -203,15 +216,25 @@ class OnPolicyRunner:
                     # Sample actions
                     actions = self.alg.act(obs, privileged_obs)
                     # Step the environment
-                    obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
+                    step_ret = self.env.step(actions.to(self.env.device))
+                    obs_dict, rewards, dones, infos = self._parse_step_return(step_ret)
+
+                    # Extract current observations from new API / old API
+                    current_obs = self._get_policy_obs(obs_dict)
+                    current_privileged_obs = self._get_privileged_obs(
+                        obs_dict, infos, self.privileged_obs_type, current_obs
+                    )
+
                     # Move to device
-                    obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
+                    current_obs = current_obs.to(self.device)
+                    current_privileged_obs = current_privileged_obs.to(self.device)
+                    rewards = rewards.to(self.device)
+                    dones = dones.to(self.device)
+
                     # perform normalization
-                    obs = self.obs_normalizer(obs)
+                    obs = self.obs_normalizer(current_obs)
                     if self.privileged_obs_type is not None:
-                        privileged_obs = self.privileged_obs_normalizer(
-                            infos["observations"][self.privileged_obs_type].to(self.device)
-                        )
+                        privileged_obs = self.privileged_obs_normalizer(current_privileged_obs)
                     else:
                         privileged_obs = obs
 
@@ -268,6 +291,7 @@ class OnPolicyRunner:
             if self.log_dir is not None and not self.disable_logs:
                 # Log information
                 self.log(locals())
+
                 # Save model
                 if it % self.save_interval == 0:
                     self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
@@ -350,14 +374,13 @@ class OnPolicyRunner:
                     "Train/mean_episode_length/time", statistics.mean(locs["lenbuffer"]), self.tot_time
                 )
 
-        str = f" \033[1m Learning iteration {locs['it']}/{locs['tot_iter']} \033[0m "
+        title = f" \033[1m Learning iteration {locs['it']}/{locs['tot_iter']} \033[0m "
 
         if len(locs["rewbuffer"]) > 0:
             log_string = (
                 f"""{'#' * width}\n"""
-                f"""{str.center(width, ' ')}\n\n"""
-                f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs[
-                    'collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
+                f"""{title.center(width, ' ')}\n\n"""
+                f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs['collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
                 f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
             )
             # -- Losses
@@ -375,9 +398,8 @@ class OnPolicyRunner:
         else:
             log_string = (
                 f"""{'#' * width}\n"""
-                f"""{str.center(width, ' ')}\n\n"""
-                f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs[
-                    'collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
+                f"""{title.center(width, ' ')}\n\n"""
+                f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs['collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
                 f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
             )
             for key, value in locs["loss_dict"].items():
@@ -388,76 +410,71 @@ class OnPolicyRunner:
             f"""{'-' * width}\n"""
             f"""{'Total timesteps:':>{pad}} {self.tot_timesteps}\n"""
             f"""{'Iteration time:':>{pad}} {iteration_time:.2f}s\n"""
-            f"""{'Time elapsed:':>{pad}} {time.strftime("%H:%M:%S", time.gmtime(self.tot_time))}\n"""
-            f"""{'ETA:':>{pad}} {time.strftime(
-                "%H:%M:%S",
-                time.gmtime(
-                    self.tot_time / (locs['it'] - locs['start_iter'] + 1)
-                    * (locs['start_iter'] + locs['num_learning_iterations'] - locs['it'])
-                )
-            )}\n"""
+            f"""{'Time elapsed:':>{pad}} {time.strftime('%H:%M:%S', time.gmtime(self.tot_time))}\n"""
+            f"""{'ETA:':>{pad}} {time.strftime('%H:%M:%S', time.gmtime(self.tot_time / (locs['it'] - locs['start_iter'] + 1) * (locs['start_iter'] + locs['num_learning_iterations'] - locs['it'])))}\n"""
         )
         print(log_string)
 
     def save(self, path: str, infos=None):
-        # -- Save model
+        # Save model
         saved_dict = {
             "model_state_dict": self.alg.policy.state_dict(),
             "optimizer_state_dict": self.alg.optimizer.state_dict(),
             "iter": self.current_learning_iteration,
             "infos": infos,
         }
-        # -- Save RND model if used
+
+        # Save RND model if used
         if self.alg.rnd:
             saved_dict["rnd_state_dict"] = self.alg.rnd.state_dict()
             saved_dict["rnd_optimizer_state_dict"] = self.alg.rnd_optimizer.state_dict()
-        # -- Save observation normalizer if used
+
+        # Save observation normalizer if used
         if self.empirical_normalization:
             saved_dict["obs_norm_state_dict"] = self.obs_normalizer.state_dict()
             saved_dict["privileged_obs_norm_state_dict"] = self.privileged_obs_normalizer.state_dict()
 
-        # save model
         torch.save(saved_dict, path)
 
         # upload model to external logging service
-        if self.logger_type in ["neptune", "wandb"] and not self.disable_logs:
+        if hasattr(self, "logger_type") and self.logger_type in ["neptune", "wandb"] and not self.disable_logs:
             self.writer.save_model(path, self.current_learning_iteration)
 
     def load(self, path: str, load_optimizer: bool = True):
         loaded_dict = torch.load(path, weights_only=False)
-        # -- Load model
+
+        # Load model
         resumed_training = self.alg.policy.load_state_dict(loaded_dict["model_state_dict"])
-        # -- Load RND model if used
+
+        # Load RND model if used
         if self.alg.rnd:
             self.alg.rnd.load_state_dict(loaded_dict["rnd_state_dict"])
-        # -- Load observation normalizer if used
+
+        # Load observation normalizer if used
         if self.empirical_normalization:
             if resumed_training:
-                # if a previous training is resumed, the actor/student normalizer is loaded for the actor/student
-                # and the critic/teacher normalizer is loaded for the critic/teacher
                 self.obs_normalizer.load_state_dict(loaded_dict["obs_norm_state_dict"])
                 self.privileged_obs_normalizer.load_state_dict(loaded_dict["privileged_obs_norm_state_dict"])
             else:
-                # if the training is not resumed but a model is loaded, this run must be distillation training following
-                # an rl training. Thus the actor normalizer is loaded for the teacher model. The student's normalizer
-                # is not loaded, as the observation space could differ from the previous rl training.
                 self.privileged_obs_normalizer.load_state_dict(loaded_dict["obs_norm_state_dict"])
-        # -- load optimizer if used
+
+        # load optimizer if used
         if load_optimizer and resumed_training:
-            # -- algorithm optimizer
             self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
-            # -- RND optimizer if used
             if self.alg.rnd:
                 self.alg.rnd_optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
-        # -- load current learning iteration
+
+        # load current learning iteration
         if resumed_training:
             self.current_learning_iteration = loaded_dict["iter"]
+
         return loaded_dict["infos"]
 
     def get_inference_policy(self, device=None):
-        self.eval_mode()  # switch to evaluation mode (dropout for example)
+        self.eval_mode()
         if device is not None:
             self.alg.policy.to(device)
+
         policy = self.alg.policy.act_inference
         if self.cfg["empirical_normalization"]:
             if device is not None:
@@ -466,23 +483,17 @@ class OnPolicyRunner:
         return policy
 
     def train_mode(self):
-        # -- PPO
         self.alg.policy.train()
-        # -- RND
         if self.alg.rnd:
             self.alg.rnd.train()
-        # -- Normalization
         if self.empirical_normalization:
             self.obs_normalizer.train()
             self.privileged_obs_normalizer.train()
 
     def eval_mode(self):
-        # -- PPO
         self.alg.policy.eval()
-        # -- RND
         if self.alg.rnd:
             self.alg.rnd.eval()
-        # -- Normalization
         if self.empirical_normalization:
             self.obs_normalizer.eval()
             self.privileged_obs_normalizer.eval()
@@ -490,40 +501,118 @@ class OnPolicyRunner:
     def add_git_repo_to_log(self, repo_file_path):
         self.git_status_repos.append(repo_file_path)
 
+    # -------------------------------------------------------------------------
+    # Helper functions for old/new observation API compatibility
+    # -------------------------------------------------------------------------
+    def _parse_obs_return(self, obs_ret):
+        """Parse env.get_observations() return value.
+
+        Supports:
+        - old API: (obs, extras)
+        - new API: obs_dict / TensorDict / tensor
+        """
+        extras = {}
+        obs_dict = obs_ret
+
+        # old API
+        if isinstance(obs_ret, tuple) and len(obs_ret) == 2:
+            obs, extras = obs_ret
+            if self._is_mapping_like(obs):
+                obs_dict = obs
+            else:
+                obs_dict = {"policy": obs}
+            return obs_dict, extras
+
+        # new API: TensorDict / dict / tensor
+        if self._is_mapping_like(obs_ret):
+            obs_dict = obs_ret
+        else:
+            obs_dict = {"policy": obs_ret}
+
+        return obs_dict, extras
+
+    def _parse_step_return(self, step_ret):
+        """Parse env.step() return value.
+
+        Supports:
+        - old API: obs, rewards, dones, infos
+        - new API: obs_dict, rewards, dones, infos
+        """
+        if not isinstance(step_ret, tuple) or len(step_ret) != 4:
+            raise ValueError("env.step(...) is expected to return 4 values: obs, rewards, dones, infos")
+
+        obs_ret, rewards, dones, infos = step_ret
+        obs_dict, _ = self._parse_obs_return(obs_ret)
+
+        if infos is None:
+            infos = {}
+
+        return obs_dict, rewards, dones, infos
+
+    def _is_mapping_like(self, x):
+        return hasattr(x, "keys") and hasattr(x, "__getitem__")
+
+    def _get_obs_by_key(self, obs_dict, extras, key: str):
+        # new API path
+        if self._is_mapping_like(obs_dict) and key in obs_dict:
+            return obs_dict[key]
+
+        # old API fallback
+        if isinstance(extras, dict):
+            obs_extras = extras.get("observations", None)
+            if isinstance(obs_extras, dict) and key in obs_extras:
+                return obs_extras[key]
+
+        return None
+
+    def _has_obs_key(self, obs_dict, extras, key: str) -> bool:
+        return self._get_obs_by_key(obs_dict, extras, key) is not None
+
+    def _get_policy_obs(self, obs_dict):
+        if self._is_mapping_like(obs_dict):
+            if "policy" in obs_dict:
+                return obs_dict["policy"]
+            # fallback: use first tensor-like entry
+            for _, v in obs_dict.items():
+                return v
+        return obs_dict
+
+    def _get_privileged_obs(self, obs_dict, extras, key: str | None, default_obs):
+        if key is None:
+            return default_obs
+        privileged_obs = self._get_obs_by_key(obs_dict, extras, key)
+        if privileged_obs is None:
+            return default_obs
+        return privileged_obs
+
     """
     Helper functions.
     """
 
     def _configure_multi_gpu(self):
         """Configure multi-gpu training."""
-        # check if distributed training is enabled
         self.gpu_world_size = int(os.getenv("WORLD_SIZE", "1"))
         self.is_distributed = self.gpu_world_size > 1
 
-        # if not distributed training, set local and global rank to 0 and return
         if not self.is_distributed:
             self.gpu_local_rank = 0
             self.gpu_global_rank = 0
             self.multi_gpu_cfg = None
             return
 
-        # get rank and world size
         self.gpu_local_rank = int(os.getenv("LOCAL_RANK", "0"))
         self.gpu_global_rank = int(os.getenv("RANK", "0"))
 
-        # make a configuration dictionary
         self.multi_gpu_cfg = {
-            "global_rank": self.gpu_global_rank,  # rank of the main process
-            "local_rank": self.gpu_local_rank,  # rank of the current process
-            "world_size": self.gpu_world_size,  # total number of processes
+            "global_rank": self.gpu_global_rank,
+            "local_rank": self.gpu_local_rank,
+            "world_size": self.gpu_world_size,
         }
 
-        # check if user has device specified for local rank
         if self.device != f"cuda:{self.gpu_local_rank}":
             raise ValueError(
                 f"Device '{self.device}' does not match expected device for local rank '{self.gpu_local_rank}'."
             )
-        # validate multi-gpu configuration
         if self.gpu_local_rank >= self.gpu_world_size:
             raise ValueError(
                 f"Local rank '{self.gpu_local_rank}' is greater than or equal to world size '{self.gpu_world_size}'."
@@ -533,7 +622,9 @@ class OnPolicyRunner:
                 f"Global rank '{self.gpu_global_rank}' is greater than or equal to world size '{self.gpu_world_size}'."
             )
 
-        # initialize torch distributed
-        torch.distributed.init_process_group(backend="nccl", rank=self.gpu_global_rank, world_size=self.gpu_world_size)
-        # set device to the local rank
+        torch.distributed.init_process_group(
+            backend="nccl",
+            rank=self.gpu_global_rank,
+            world_size=self.gpu_world_size,
+        )
         torch.cuda.set_device(self.gpu_local_rank)
