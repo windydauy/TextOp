@@ -1,9 +1,9 @@
 """Script to play a checkpoint if an RL agent from RSL-RL."""
 """Launch Isaac Sim Simulator first."""
-EXPORT_ONNX = True
 
 import argparse
 import sys
+import time
 from pathlib import Path
 from isaaclab.app import AppLauncher
 import glob
@@ -22,6 +22,9 @@ parser.add_argument("--num_envs", type=int, default=None, help="Number of enviro
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--resume_path", type=str, default=None, help="Path to the resume checkpoint.")
 parser.add_argument("--motion_file", type=str, default=None, help="Path to the motion file.")
+parser.add_argument("--real_time", action="store_true", default=False, help="Run close to real_time if possible.")
+parser.add_argument("--playback_speed", type=float, default=1.0, help="Playback speed multiplier when real_time is enabled.")
+parser.add_argument("--export_onnx", action="store_true", default=False, help="Export the loaded policy to ONNX.")
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -70,6 +73,28 @@ def load_config(resume_path: str) -> tuple[ManagerBasedRLEnvCfg, RslRlOnPolicyRu
     env_cfg = load_pickle(str(param_dir / "env.pkl"))
     agent_cfg = load_pickle(str(param_dir / "agent.pkl"))
     return env_cfg, agent_cfg
+
+
+def _sleep_to_real_time(
+    real_time: bool,
+    playback_speed: float,
+    step_dt: float,
+    step_start_time: float,
+    *,
+    now_fn=time.time,
+    sleep_fn=time.sleep,
+) -> None:
+    """Sleep for the remaining control step duration when real-time playback is enabled."""
+    if not real_time:
+        return
+
+    if playback_speed <= 0.0:
+        raise ValueError("playback_speed must be > 0")
+
+    target_step_duration = step_dt / playback_speed
+    sleep_time = target_step_duration - (now_fn() - step_start_time)
+    if sleep_time > 0.0:
+        sleep_fn(sleep_time)
 
 
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
@@ -165,9 +190,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # obtain the trained policy for inference
     policy = ppo_runner.get_inference_policy(device=env.unwrapped.device)
 
-    if EXPORT_ONNX:
+    if args_cli.export_onnx:
         # export policy to onnx/jit
         export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
+        print(f"[INFO]: Exporting ONNX policy to: {export_model_dir}")
 
         export_motion_policy_as_onnx(
             env.unwrapped,
@@ -179,17 +205,20 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         attach_onnx_metadata(env.unwrapped, args_cli.wandb_path if args_cli.wandb_path else "none", export_model_dir)
     # reset environment
     obs, _ = env.get_observations()
+    step_dt = env.unwrapped.step_dt
     timestep = 0
 
     print("Start playing...")
     # simulate environment
     while simulation_app.is_running():
+        step_start_time = time.time()
         # run everything in inference mode
         with torch.inference_mode():
             # agent stepping
             actions = policy(obs)
             # env stepping
             obs, _, _, _ = env.step(actions)
+        _sleep_to_real_time(args_cli.real_time, args_cli.playback_speed, step_dt, step_start_time)
         if args_cli.video:
             timestep += 1
             # Exit the play loop after recording one video

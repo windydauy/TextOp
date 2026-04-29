@@ -62,6 +62,38 @@ class G1FlatPPOModNormRunnerCfg(RslRlOnPolicyRunnerCfg):
     )
 
 
+@configclass
+class G1FlatPPOModNorm5LRunnerCfg(RslRlOnPolicyRunnerCfg):
+    """5-layer wide-MLP variant (4096→2048→1024→512→256) for NMMLP5L tasks."""
+    num_steps_per_env = 24
+    max_iterations = 100000
+    save_interval = 500
+    experiment_name = "g1_flat"
+    empirical_normalization = True
+    policy = RslRlPpoActorCriticCfg(
+        class_name="ActorCriticMNMLP",
+        init_noise_std=1.0,
+        actor_hidden_dims=[4096, 2048, 1024, 512, 256],
+        critic_hidden_dims=[4096, 2048, 1024, 512, 256],
+        activation="elu",
+    )
+    algorithm = RslRlPpoAlgorithmCfg(
+        class_name="PPO_MNMLP",
+        value_loss_coef=1.0,
+        use_clipped_value_loss=True,
+        clip_param=0.2,
+        entropy_coef=0.005,
+        num_learning_epochs=5,
+        num_mini_batches=4,
+        learning_rate=1.0e-3,
+        schedule="adaptive",
+        gamma=0.99,
+        lam=0.95,
+        desired_kl=0.01,
+        max_grad_norm=1.0,
+    )
+
+
 LOW_FREQ_SCALE = 0.5
 
 

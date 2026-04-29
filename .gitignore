@@ -201,3 +201,6 @@ TextOpTracker/logs/*
 TextOpTracker/outputs/*
 TextOpTracker/recordings/*
 TextOpTracker_partial/*
+exported/
+motions_lafan/
+motion_ae/

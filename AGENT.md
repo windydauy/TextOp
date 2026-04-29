@@ -1,0 +1,2 @@
+我现在有一个很严重的bug，/home/humanoid/yzh/TextOp/TextOpTracker/scripts/mujoco_csv_to_npz.py这个脚本 使用mujoco的api 进行前向计算把soma_csv文件转成 能在isaaclab中使用的npz。可能是由于mujoco中的xml和 isaac 使用的 urdf 顺序不一致，所以导致转换出的joint_pos, joint_vel,
+    body_pos_w, body_quat_w, body_lin_vel_w, body_ang_vel_w 等键值不匹配。请你为我修复这个bug。可以彻底重写我的mujoco_csv_to_npz.py 文件

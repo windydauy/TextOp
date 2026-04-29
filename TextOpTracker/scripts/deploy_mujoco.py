@@ -3,11 +3,10 @@ import time
 import mujoco, mujoco_viewer, mujoco.viewer
 # `$ pip install mujoco-python-viewer` If `mujoco_viewer` not found.
 import numpy as np
-import torch
-from isaaclab.utils.math import matrix_from_quat, subtract_frame_transforms
 import onnxruntime as ort
 import argparse
 from enum import Enum
+from pathlib import Path
 
 
 # 定义枚举类型
@@ -17,6 +16,17 @@ class AnchorBody(Enum):
 
 
 anchor_body = AnchorBody.PELVIS
+
+
+def resolve_anchor_body(anchor_body_name: str) -> AnchorBody:
+    normalized_name = anchor_body_name.strip().upper()
+    try:
+        return AnchorBody[normalized_name]
+    except KeyError as exc:
+        valid_names = [member.name.lower() for member in AnchorBody]
+        raise ValueError(
+            f"Unsupported anchor_body_name: {anchor_body_name}. Expected one of {valid_names}."
+        ) from exc
 
 isaaclab_joint_names = [
     "left_hip_pitch_joint",
@@ -292,9 +302,11 @@ def update_joint_visualization(viewer, motion_loader, t):
 
 # ====== MotionLoader 类（参考 isaaclab） ======
 class MotionLoader:
-    def __init__(self, motion_file):
-        print(motion_file)
-        data = np.load(motion_file)
+    def __init__(self, motion_file, anchor_body_name: str | None = None):
+        p = Path(motion_file)
+        motion_path = str(p / "motion.npz") if p.is_dir() else str(p)
+        print(motion_path)
+        data = np.load(motion_path)
         self.joint_pos = data["joint_pos"]  # [T, 29]
         self.joint_vel = data["joint_vel"]  # [T, 29]
         self.body_pos = data["body_pos_w"]  # [T, N, 3]
@@ -322,8 +334,9 @@ class MotionLoader:
             "right_elbow_link",
             "right_wrist_yaw_link",
         ]
-        self.anchor_body_name = anchor_body.name.lower()
-        self.anchor_body_index = anchor_body.value
+        selected_anchor_body = resolve_anchor_body(anchor_body_name) if anchor_body_name is not None else anchor_body
+        self.anchor_body_name = selected_anchor_body.name.lower()
+        self.anchor_body_index = self.body_names.index(self.anchor_body_name)
 
         # Future steps configuration
         self.future_steps = 5
@@ -360,6 +373,80 @@ def quat_rotate_inverse_np(q: np.ndarray, v: np.ndarray) -> np.ndarray:
         c = q_vec * dot_product * 2.0
 
     return a - b + c
+
+
+def _quat_mul_wxyz_np(q: np.ndarray, r: np.ndarray) -> np.ndarray:
+    """Hamilton product, both quaternions wxyz. Broadcasts on leading dims."""
+    q = np.asarray(q, dtype=np.float64)
+    r = np.asarray(r, dtype=np.float64)
+    qw, qx, qy, qz = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
+    rw, rx, ry, rz = r[..., 0], r[..., 1], r[..., 2], r[..., 3]
+    out = np.empty(np.broadcast_shapes(q.shape, r.shape), dtype=np.float64)
+    out[..., 0] = qw * rw - qx * rx - qy * ry - qz * rz
+    out[..., 1] = qw * rx + qx * rw + qy * rz - qz * ry
+    out[..., 2] = qw * ry - qx * rz + qy * rw + qz * rx
+    out[..., 3] = qw * rz + qx * ry - qy * rx + qz * rw
+    return out
+
+
+def _quat_inv_wxyz_np(q: np.ndarray) -> np.ndarray:
+    """Unit quaternion inverse (conjugate) wxyz."""
+    q = np.asarray(q, dtype=np.float64)
+    out = np.empty_like(q)
+    out[..., 0] = q[..., 0]
+    out[..., 1:] = -q[..., 1:]
+    return out
+
+
+def matrix_from_quat_np(quat: np.ndarray) -> np.ndarray:
+    """wxyz -> rotation matrix R (world from body), shape (..., 3, 3)."""
+    q = np.asarray(quat, dtype=np.float64)
+    w, x, y, z = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
+    xx, yy, zz = x * x, y * y, z * z
+    xy, xz, yz = x * y, x * z, y * z
+    wx, wy, wz = w * x, w * y, w * z
+    m00 = 1.0 - 2.0 * (yy + zz)
+    m01 = 2.0 * (xy - wz)
+    m02 = 2.0 * (xz + wy)
+    m10 = 2.0 * (xy + wz)
+    m11 = 1.0 - 2.0 * (xx + zz)
+    m12 = 2.0 * (yz - wx)
+    m20 = 2.0 * (xz - wy)
+    m21 = 2.0 * (yz + wx)
+    m22 = 1.0 - 2.0 * (xx + yy)
+    R = np.stack(
+        [
+            np.stack([m00, m01, m02], axis=-1),
+            np.stack([m10, m11, m12], axis=-1),
+            np.stack([m20, m21, m22], axis=-1),
+        ],
+        axis=-2,
+    )
+    return R.astype(np.float32, copy=False)
+
+
+def subtract_frame_transforms_np(
+    t01: np.ndarray,
+    q01: np.ndarray,
+    t02: np.ndarray,
+    q02: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Match Isaac Lab: relative pose of (t02,q02) expressed in frame of (t01,q01); world-frame inputs."""
+    t01 = np.asarray(t01, dtype=np.float64)
+    q01 = np.asarray(q01, dtype=np.float64)
+    t02 = np.asarray(t02, dtype=np.float64)
+    q02 = np.asarray(q02, dtype=np.float64)
+    R_w_1 = matrix_from_quat_np(q01)
+    if R_w_1.ndim == 2:
+        delta = t02 - t01
+        pos_b = (R_w_1.T @ delta.reshape(3, 1)).reshape(3)
+    else:
+        delta = t02 - t01
+        R_1_w = np.swapaxes(R_w_1, -1, -2)
+        pos_b = np.einsum("...ij,...j->...i", R_1_w, delta)
+    ori_b = _quat_mul_wxyz_np(_quat_inv_wxyz_np(q01), q02).astype(np.float32, copy=False)
+    pos_b = pos_b.astype(np.float32, copy=False)
+    return pos_b, ori_b
 
 
 # ====== observation 计算函数 ======
@@ -415,14 +502,14 @@ def motion_anchor_pos_b_future(sim_data, motion_loader, t):
     robot_anchor_quat_w_exp = robot_quat.repeat(motion_loader.future_steps, axis=0)  # [5, 4]
 
     # Transform all future steps at once
-    pos_b, _ = subtract_frame_transforms(
-        torch.from_numpy(robot_anchor_pos_w_exp).float(),
-        torch.from_numpy(robot_anchor_quat_w_exp).float(),
-        torch.from_numpy(future_anchor_pos_w).float(),
-        torch.from_numpy(future_anchor_quat_w).float(),
+    pos_b, _ = subtract_frame_transforms_np(
+        robot_anchor_pos_w_exp,
+        robot_anchor_quat_w_exp,
+        future_anchor_pos_w,
+        future_anchor_quat_w,
     )
 
-    pos_b_flat = np.array(pos_b, dtype=np.float32).flatten()  # [15]
+    pos_b_flat = pos_b.flatten()  # [15]
     return pos_b_flat  # [15]
 
 
@@ -453,15 +540,15 @@ def motion_anchor_ori_b_future(sim_data, motion_loader, t):
     robot_anchor_quat_w_exp = robot_quat.repeat(motion_loader.future_steps, axis=0)  # [5, 4]
 
     # Transform all future steps at once
-    pos_b, ori_b = subtract_frame_transforms(
-        torch.from_numpy(robot_anchor_pos_w_exp).float(),
-        torch.from_numpy(robot_anchor_quat_w_exp).float(),
-        torch.from_numpy(future_anchor_pos_w).float(),
-        torch.from_numpy(future_anchor_quat_w).float(),
+    pos_b, ori_b = subtract_frame_transforms_np(
+        robot_anchor_pos_w_exp,
+        robot_anchor_quat_w_exp,
+        future_anchor_pos_w,
+        future_anchor_quat_w,
     )
 
     # Convert to rotation matrix and take first 2 rows
-    mat = matrix_from_quat(ori_b)
+    mat = matrix_from_quat_np(ori_b)
     mat_flat = mat[..., :2].reshape(-1)
     # breakpoint()
     ori_b_flat = np.array(mat_flat, dtype=np.float32).flatten()  # [30]
@@ -492,14 +579,14 @@ def robot_body_pos_b(sim_data, motion_loader, t):
     robot_anchor_pos_expanded = robot_anchor_pos.repeat(len(motion_loader.body_names), axis=0)  # [14, 3]
     robot_anchor_quat_expanded = robot_anchor_quat.repeat(len(motion_loader.body_names), axis=0)  # [14, 4]
 
-    pos_b, _ = subtract_frame_transforms(
-        torch.from_numpy(robot_anchor_pos_expanded).float(),
-        torch.from_numpy(robot_anchor_quat_expanded).float(),
-        torch.from_numpy(robot_body_pos).float(),
-        torch.from_numpy(robot_body_quat).float(),
+    pos_b, _ = subtract_frame_transforms_np(
+        robot_anchor_pos_expanded,
+        robot_anchor_quat_expanded,
+        robot_body_pos,
+        robot_body_quat,
     )
 
-    return np.array(pos_b, dtype=np.float32).flatten()  # [42]
+    return pos_b.flatten()  # [42]
 
 
 def robot_body_ori_b(sim_data, motion_loader, t):
@@ -525,18 +612,18 @@ def robot_body_ori_b(sim_data, motion_loader, t):
     robot_anchor_pos_expanded = robot_anchor_pos.repeat(len(motion_loader.body_names), axis=0)  # [14, 3]
     robot_anchor_quat_expanded = robot_anchor_quat.repeat(len(motion_loader.body_names), axis=0)  # [14, 4]
 
-    _, ori_b = subtract_frame_transforms(
-        torch.from_numpy(robot_anchor_pos_expanded).float(),
-        torch.from_numpy(robot_anchor_quat_expanded).float(),
-        torch.from_numpy(robot_body_pos).float(),
-        torch.from_numpy(robot_body_quat).float(),
+    _, ori_b = subtract_frame_transforms_np(
+        robot_anchor_pos_expanded,
+        robot_anchor_quat_expanded,
+        robot_body_pos,
+        robot_body_quat,
     )
 
     # Convert to rotation matrix and take first 2 rows
-    mat = matrix_from_quat(ori_b)
+    mat = matrix_from_quat_np(ori_b)
     mat_flat = mat[..., :2].reshape(-1)
 
-    return np.array(mat_flat, dtype=np.float32).flatten()  # [84]
+    return mat_flat.astype(np.float32, copy=False).flatten()  # [84]
 
 
 def get_base_lin_vel(sim_data):
@@ -590,19 +677,95 @@ def get_projected_gravity(sim_data):
     return gravity_orientation
 
 
+def get_robot_anchor_pos_w(sim_data, motion_loader):
+    """Robot anchor body position in world frame, shape (3,)."""
+    return sim_data.body(motion_loader.anchor_body_name).xpos.copy().astype(np.float32)
+
+
+def get_robot_anchor_ori_w(sim_data, motion_loader):
+    """Robot anchor body orientation as first 2 rows of rotation matrix, shape (6,).
+
+    MuJoCo xquat is (w, x, y, z), matching the wxyz convention used by matrix_from_quat_np.
+    """
+    quat = sim_data.body(motion_loader.anchor_body_name).xquat.copy()  # wxyz
+    mat = matrix_from_quat_np(quat)   # (3, 3)
+    return mat[:2].flatten().astype(np.float32)  # (6,)
+
+
 #
 
 
-def compute_observation(sim_data, motion_loader, t, last_actions):
-    """Compute observation matching PrivPrivObservationsCfg structure"""
-    # obs_dim = 554
-    obs_dim = 554 - 42 - 84
-    # obs_dim = 160
-    USE_PRIVPRIV_OBS = False
-    # USE_PROJ_GRAV = False
-    USE_PROJ_GRAV = True
-    obs_dim = obs_dim + 42 + 84 if USE_PRIVPRIV_OBS else obs_dim
-    obs_dim = obs_dim + 3 if USE_PROJ_GRAV else obs_dim
+_OBS_DIMS = {
+    # command(290) + anchor_pos_b(15) + anchor_ori_b(30) + proj_grav(3)
+    # + lin_vel(3) + ang_vel(3) + joint_pos(29) + joint_vel(29) + actions(29)
+    "ProjGravObs": 431,
+    # same as above + robot_anchor_pos_w(3) + robot_anchor_ori_w(6)
+    "ProjGravAnchorObs": 440,
+}
+
+_OBS_SEGMENTS = {
+    "ProjGravObs": [
+        ("command", 290),
+        ("motion_anchor_pos_b", 15),
+        ("motion_anchor_ori_b", 30),
+        ("projected_gravity", 3),
+        ("base_lin_vel", 3),
+        ("base_ang_vel", 3),
+        ("joint_pos", 29),
+        ("joint_vel", 29),
+        ("actions", 29),
+    ],
+    "ProjGravAnchorObs": [
+        ("command", 290),
+        ("motion_anchor_pos_b", 15),
+        ("motion_anchor_ori_b", 30),
+        ("robot_anchor_pos_w", 3),
+        ("robot_anchor_ori_w", 6),
+        ("projected_gravity", 3),
+        ("base_lin_vel", 3),
+        ("base_ang_vel", 3),
+        ("joint_pos", 29),
+        ("joint_vel", 29),
+        ("actions", 29),
+    ],
+}
+
+
+def iter_observation_segments(obs: np.ndarray, obs_config: str):
+    obs = np.asarray(obs, dtype=np.float32).reshape(-1)
+    idx = 0
+    for name, dim in _OBS_SEGMENTS[obs_config]:
+        yield name, obs[idx:idx + dim]
+        idx += dim
+    if idx != obs.shape[0]:
+        raise ValueError(
+            f"Observation layout mismatch for {obs_config}: consumed {idx} values, got {obs.shape[0]}."
+        )
+
+
+def print_observation_debug(obs: np.ndarray, obs_config: str, t: int):
+    print(f"\n[OBS DEBUG] t={t} obs_config={obs_config} dim={obs.shape[0]}")
+    for name, segment in iter_observation_segments(obs, obs_config):
+        values = np.array2string(
+            segment,
+            precision=5,
+            separator=", ",
+            threshold=segment.shape[0],
+            max_line_width=100000,
+        )
+        print(f"  {name:<20} ({segment.shape[0]:>3d}) = {values}")
+    print()
+
+
+def compute_observation(sim_data, motion_loader, t, last_actions, obs_config: str = "ProjGravObs"):
+    """Compute observation vector for the given obs_config.
+
+    Supported configs:
+      - "ProjGravObs"        : 431-dim  (Tracking-Flat-G1-ProjGravObs-MNMLP-v0)
+      - "ProjGravAnchorObs"  : 440-dim  (Tracking-Flat-G1-ProjGravAnchorObs-NMMLP-v0
+                                         and Tracking-Flat-G1-ProjGravAnchorObs-NMMLP5L-v0)
+    """
+    obs_dim = _OBS_DIMS[obs_config]
 
     if t < 0:
         return np.zeros(obs_dim, dtype=np.float32)
@@ -612,73 +775,58 @@ def compute_observation(sim_data, motion_loader, t, last_actions):
 
     # 0. command (290,) - future joint pos + vel
     command = get_command(motion_loader, t)
-    dim_command = command.shape[0]
-    obs[idx:idx + dim_command] = command
-    idx += dim_command
+    obs[idx:idx + command.shape[0]] = command
+    idx += command.shape[0]
 
     # 1. motion_anchor_pos_b (15,) - future anchor pos in body frame
     motion_anchor_pos = motion_anchor_pos_b_future(sim_data, motion_loader, t)
-    dim_motion_anchor_pos = motion_anchor_pos.shape[0]
-    obs[idx:idx + dim_motion_anchor_pos] = motion_anchor_pos
-    idx += dim_motion_anchor_pos
+    obs[idx:idx + motion_anchor_pos.shape[0]] = motion_anchor_pos
+    idx += motion_anchor_pos.shape[0]
 
     # 2. motion_anchor_ori_b (30,) - future anchor ori in body frame
     motion_anchor_ori = motion_anchor_ori_b_future(sim_data, motion_loader, t)
-    dim_motion_anchor_ori = motion_anchor_ori.shape[0]
-    obs[idx:idx + dim_motion_anchor_ori] = motion_anchor_ori
-    idx += dim_motion_anchor_ori
+    obs[idx:idx + motion_anchor_ori.shape[0]] = motion_anchor_ori
+    idx += motion_anchor_ori.shape[0]
 
-    # breakpoint()
-    if USE_PROJ_GRAV:
-        # 3. projected_gravity (3,) - projected gravity
-        projected_gravity = get_projected_gravity(sim_data)
-        dim_projected_gravity = projected_gravity.shape[0]
-        obs[idx:idx + dim_projected_gravity] = projected_gravity
-        idx += dim_projected_gravity
+    # 3. [ProjGravAnchorObs only] robot_anchor_pos_w (3,) + robot_anchor_ori_w (6,)
+    if obs_config == "ProjGravAnchorObs":
+        robot_ap = get_robot_anchor_pos_w(sim_data, motion_loader)
+        obs[idx:idx + robot_ap.shape[0]] = robot_ap
+        idx += robot_ap.shape[0]
 
-    # if True:
-    if USE_PRIVPRIV_OBS:
-        # 3. body_pos (42,) - robot body pos in body frame
-        body_pos = robot_body_pos_b(sim_data, motion_loader, t)
-        dim_body_pos = body_pos.shape[0]
-        obs[idx:idx + dim_body_pos] = body_pos
-        idx += dim_body_pos
+        robot_ao = get_robot_anchor_ori_w(sim_data, motion_loader)
+        obs[idx:idx + robot_ao.shape[0]] = robot_ao
+        idx += robot_ao.shape[0]
 
-        # 4. body_ori (84,) - robot body ori in body frame
-        body_ori = robot_body_ori_b(sim_data, motion_loader, t)
-        dim_body_ori = body_ori.shape[0]
-        obs[idx:idx + dim_body_ori] = body_ori
-        idx += dim_body_ori
+    # 4. projected_gravity (3,)
+    projected_gravity = get_projected_gravity(sim_data)
+    obs[idx:idx + projected_gravity.shape[0]] = projected_gravity
+    idx += projected_gravity.shape[0]
 
-    # 5. base_lin_vel (3,) - base linear velocity
+    # 5. base_lin_vel (3,)
     base_lin_vel = get_base_lin_vel(sim_data)
-    dim_base_lin_vel = base_lin_vel.shape[0]
-    obs[idx:idx + dim_base_lin_vel] = base_lin_vel
-    idx += dim_base_lin_vel
+    obs[idx:idx + base_lin_vel.shape[0]] = base_lin_vel
+    idx += base_lin_vel.shape[0]
 
-    # 6. base_ang_vel (3,) - base angular velocity
+    # 6. base_ang_vel (3,)
     base_ang_vel = get_base_ang_vel(sim_data)
-    dim_base_ang_vel = base_ang_vel.shape[0]
-    obs[idx:idx + dim_base_ang_vel] = base_ang_vel
-    idx += dim_base_ang_vel
+    obs[idx:idx + base_ang_vel.shape[0]] = base_ang_vel
+    idx += base_ang_vel.shape[0]
 
-    # 7. joint_pos (29,) - relative joint positions
+    # 7. joint_pos (29,) - relative joint positions, reindexed to Isaac Lab order
     joint_pos = get_joint_pos_rel(sim_data)[mujoco_to_isaaclab_reindex]
-    dim_joint_pos = joint_pos.shape[0]
-    obs[idx:idx + dim_joint_pos] = joint_pos
-    idx += dim_joint_pos
+    obs[idx:idx + joint_pos.shape[0]] = joint_pos
+    idx += joint_pos.shape[0]
 
-    # 8. joint_vel (29,) - relative joint velocities
+    # 8. joint_vel (29,) - relative joint velocities, reindexed to Isaac Lab order
     joint_vel = get_joint_vel_rel(sim_data)[mujoco_to_isaaclab_reindex]
-    dim_joint_vel = joint_vel.shape[0]
-    obs[idx:idx + dim_joint_vel] = joint_vel
-    idx += dim_joint_vel
+    obs[idx:idx + joint_vel.shape[0]] = joint_vel
+    idx += joint_vel.shape[0]
 
     # 9. actions (29,) - last actions
     last_action = get_last_action(last_actions)
-    dim_last_action = last_action.shape[0]
-    obs[idx:idx + dim_last_action] = last_action
-    idx += dim_last_action
+    obs[idx:idx + last_action.shape[0]] = last_action
+    idx += last_action.shape[0]
 
     return obs
 
@@ -698,6 +846,37 @@ if __name__ == "__main__":
         type=str,
         default="",
         help="Path to policy file (.onnx)",
+    )
+    parser.add_argument(
+        "--obs_config",
+        type=str,
+        default="ProjGravObs",
+        choices=["ProjGravObs", "ProjGravAnchorObs"],
+        help=(
+            "Observation config to use. "
+            "'ProjGravObs' (431-dim) for Tracking-Flat-G1-ProjGravObs-MNMLP-v0; "
+            "'ProjGravAnchorObs' (440-dim) for Tracking-Flat-G1-ProjGravAnchorObs-NMMLP-v0 "
+            "and Tracking-Flat-G1-ProjGravAnchorObs-NMMLP5L-v0."
+        ),
+    )
+    parser.add_argument(
+        "--anchor_body_name",
+        type=str,
+        default="pelvis",
+        choices=["pelvis", "torso_link"],
+        help="Anchor body used to build motion-anchor and robot-anchor observations.",
+    )
+    parser.add_argument(
+        "--debug_obs",
+        action="store_true",
+        default=False,
+        help="Print observation segments for debugging.",
+    )
+    parser.add_argument(
+        "--debug_obs_steps",
+        type=int,
+        default=5,
+        help="How many policy steps to print when --debug_obs is enabled.",
     )
 
     args = parser.parse_args()
@@ -734,7 +913,7 @@ if __name__ == "__main__":
     session = ort.InferenceSession(policy_path)
     obs_name = session.get_inputs()[0].name
 
-    motion_loader = MotionLoader(motion_path)
+    motion_loader = MotionLoader(motion_path, anchor_body_name=args.anchor_body_name)
     T = motion_loader.T
     print("obs dim: ", session.get_inputs()[0])
     print("T: ", T)
@@ -775,7 +954,9 @@ if __name__ == "__main__":
             # breakpoint()
 
             print("t: ", inner_counter, "/", T, end='\r')
-            obs = compute_observation(d, motion_loader, inner_counter, action)
+            obs = compute_observation(d, motion_loader, inner_counter, action, args.obs_config)
+            if args.debug_obs and inner_counter < args.debug_obs_steps:
+                print_observation_debug(obs, args.obs_config, inner_counter)
             obs_tensor = np.array(obs, dtype=np.float32).reshape(1, -1)
 
             output = session.run(None, {obs_name: obs_tensor})

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from scipy.spatial.transform import Rotation as _Rotation
 from isaaclab.app import AppLauncher
 
 
@@ -85,17 +86,11 @@ def _is_number(text: str) -> bool:
 
 
 def _euler_xyz_deg_to_quat_wxyz(rx_deg: np.ndarray, ry_deg: np.ndarray, rz_deg: np.ndarray) -> np.ndarray:
-    rx = np.deg2rad(rx_deg)
-    ry = np.deg2rad(ry_deg)
-    rz = np.deg2rad(rz_deg)
-    cx, sx = np.cos(rx * 0.5), np.sin(rx * 0.5)
-    cy, sy = np.cos(ry * 0.5), np.sin(ry * 0.5)
-    cz, sz = np.cos(rz * 0.5), np.sin(rz * 0.5)
-    qw = cx * cy * cz - sx * sy * sz
-    qx = sx * cy * cz + cx * sy * sz
-    qy = cx * sy * cz - sx * cy * sz
-    qz = cx * cy * sz + sx * sy * cz
-    return np.stack([qw, qx, qy, qz], axis=1).astype(np.float32, copy=False)
+    """Extrinsic-XYZ degrees (SOMA convention) -> wxyz quaternion array."""
+    euler_deg = np.stack([rx_deg, ry_deg, rz_deg], axis=1)
+    rad = np.deg2rad(euler_deg)
+    q_xyzw = _Rotation.from_euler("xyz", rad).as_quat()  # scipy xyzw
+    return np.column_stack([q_xyzw[:, 3], q_xyzw[:, :3]]).astype(np.float32, copy=False)
 
 
 def _frame_slice(frame_range: tuple[int, int] | None, total_frames: int) -> slice:
