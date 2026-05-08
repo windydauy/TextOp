@@ -1,13 +1,107 @@
+import glob
 import re
 import time
 import mujoco, mujoco_viewer, mujoco.viewer
 # `$ pip install mujoco-python-viewer` If `mujoco_viewer` not found.
 import numpy as np
 import torch
-from isaaclab.utils.math import matrix_from_quat, subtract_frame_transforms
-import onnxruntime as ort
 import argparse
 from enum import Enum
+from pathlib import Path
+
+
+def quat_conjugate(q: torch.Tensor) -> torch.Tensor:
+    """Conjugate quaternion in wxyz convention."""
+    return torch.cat((q[..., 0:1], -q[..., 1:]), dim=-1)
+
+
+def quat_inv(q: torch.Tensor, eps: float = 1e-9) -> torch.Tensor:
+    """Inverse quaternion in wxyz convention."""
+    return quat_conjugate(q) / q.pow(2).sum(dim=-1, keepdim=True).clamp(min=eps)
+
+
+def quat_mul(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
+    """Multiply quaternions in wxyz convention."""
+    w1, x1, y1, z1 = torch.unbind(q1, dim=-1)
+    w2, x2, y2, z2 = torch.unbind(q2, dim=-1)
+    return torch.stack(
+        (
+            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        ),
+        dim=-1,
+    )
+
+
+def quat_apply(quat: torch.Tensor, vec: torch.Tensor) -> torch.Tensor:
+    """Rotate vectors by quaternions in wxyz convention."""
+    shape = vec.shape
+    quat = quat.reshape(-1, 4)
+    vec = vec.reshape(-1, 3)
+    xyz = quat[:, 1:]
+    t = torch.cross(xyz, vec, dim=-1) * 2.0
+    return (vec + quat[:, 0:1] * t + torch.cross(xyz, t, dim=-1)).view(shape)
+
+
+def matrix_from_quat(quaternions: torch.Tensor) -> torch.Tensor:
+    """Convert wxyz quaternions to rotation matrices."""
+    r, i, j, k = torch.unbind(quaternions, dim=-1)
+    two_s = 2.0 / (quaternions * quaternions).sum(dim=-1)
+    mat = torch.stack(
+        (
+            1 - two_s * (j * j + k * k),
+            two_s * (i * j - k * r),
+            two_s * (i * k + j * r),
+            two_s * (i * j + k * r),
+            1 - two_s * (i * i + k * k),
+            two_s * (j * k - i * r),
+            two_s * (i * k - j * r),
+            two_s * (j * k + i * r),
+            1 - two_s * (i * i + j * j),
+        ),
+        dim=-1,
+    )
+    return mat.reshape(quaternions.shape[:-1] + (3, 3))
+
+
+def subtract_frame_transforms(
+    t01: torch.Tensor,
+    q01: torch.Tensor,
+    t02: torch.Tensor | None = None,
+    q02: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute T12 = inv(T01) * T02 using wxyz quaternions."""
+    q10 = quat_inv(q01)
+    q12 = quat_mul(q10, q02) if q02 is not None else q10
+    t12 = quat_apply(q10, t02 - t01) if t02 is not None else quat_apply(q10, -t01)
+    return t12, q12
+
+
+def load_onnxruntime():
+    try:
+        import onnxruntime as ort
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "onnxruntime is required to run the exported policy. Install it in this environment, "
+            "for example: pip install onnxruntime or pip install onnxruntime-gpu"
+        ) from exc
+    return ort
+
+
+NUM_ACTIONS = 29
+COMMAND_DIM_PER_STEP = NUM_ACTIONS * 2
+ANCHOR_POS_DIM_PER_STEP = 3
+ANCHOR_ORI_DIM_PER_STEP = 6
+PROJECTED_GRAVITY_DIM = 3
+ROBOT_ANCHOR_POS_DIM = 3
+ROBOT_ANCHOR_ORI_DIM = 6
+BASE_LIN_VEL_DIM = 3
+BASE_ANG_VEL_DIM = 3
+JOINT_POS_DIM = NUM_ACTIONS
+JOINT_VEL_DIM = NUM_ACTIONS
+LAST_ACTION_DIM = NUM_ACTIONS
 
 
 # 定义枚举类型
@@ -17,6 +111,28 @@ class AnchorBody(Enum):
 
 
 anchor_body = AnchorBody.PELVIS
+
+ANCHOR_BODY_INDEX_BY_NAME = {
+    "pelvis": AnchorBody.PELVIS.value,
+    "torso_link": AnchorBody.TORSO_LINK.value,
+}
+
+DEFAULT_BODY_NAMES = [
+    "pelvis",
+    "left_hip_roll_link",
+    "left_knee_link",
+    "left_ankle_roll_link",
+    "right_hip_roll_link",
+    "right_knee_link",
+    "right_ankle_roll_link",
+    "torso_link",
+    "left_shoulder_roll_link",
+    "left_elbow_link",
+    "left_wrist_yaw_link",
+    "right_shoulder_roll_link",
+    "right_elbow_link",
+    "right_wrist_yaw_link",
+]
 
 isaaclab_joint_names = [
     "left_hip_pitch_joint",
@@ -265,6 +381,88 @@ def __fix__add_marker_to_scene(self, marker):
 mujoco_viewer.MujocoViewer._add_marker_to_scene = __fix__add_marker_to_scene
 
 
+def _csv_metadata_list(value):
+    if not value:
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def get_policy_metadata(session):
+    try:
+        return dict(session.get_modelmeta().custom_metadata_map)
+    except Exception:
+        return {}
+
+
+def get_policy_input_dim(session):
+    shape = session.get_inputs()[0].shape
+    if len(shape) < 2:
+        return None
+    dim = shape[1]
+    return dim if isinstance(dim, int) else None
+
+
+def _uses_projected_gravity(obs_config):
+    return "ProjGrav" in obs_config
+
+
+def _uses_robot_anchor_obs(obs_config):
+    return "AnchorObs" in obs_config
+
+
+def compute_observation_dim(future_steps, obs_config="ProjGravObs"):
+    future_dim = future_steps * (COMMAND_DIM_PER_STEP + ANCHOR_POS_DIM_PER_STEP + ANCHOR_ORI_DIM_PER_STEP)
+    fixed_dim = BASE_LIN_VEL_DIM + BASE_ANG_VEL_DIM + JOINT_POS_DIM + JOINT_VEL_DIM + LAST_ACTION_DIM
+    if _uses_projected_gravity(obs_config):
+        fixed_dim += PROJECTED_GRAVITY_DIM
+    if _uses_robot_anchor_obs(obs_config):
+        fixed_dim += ROBOT_ANCHOR_POS_DIM + ROBOT_ANCHOR_ORI_DIM
+    return future_dim + fixed_dim
+
+
+def infer_future_steps_from_input_dim(input_dim, obs_config="ProjGravObs"):
+    if input_dim is None:
+        return None
+    fixed_dim = compute_observation_dim(0, obs_config)
+    per_step_dim = COMMAND_DIM_PER_STEP + ANCHOR_POS_DIM_PER_STEP + ANCHOR_ORI_DIM_PER_STEP
+    remainder = input_dim - fixed_dim
+    if remainder <= 0 or remainder % per_step_dim != 0:
+        raise ValueError(
+            f"Cannot infer future_steps from ONNX input dim {input_dim} with obs_config={obs_config}. "
+            f"Fixed dim={fixed_dim}, per-step dim={per_step_dim}."
+        )
+    return remainder // per_step_dim
+
+
+def resolve_motion_file(motion_path):
+    path = Path(motion_path)
+    candidates = []
+
+    if path.is_file():
+        return str(path)
+    if path.is_dir():
+        candidates.append(path / "motion.npz")
+    if any(ch in motion_path for ch in "*?[]"):
+        candidates.extend(Path(p) for p in glob.glob(motion_path))
+        candidates.extend(Path(p) for p in glob.glob(str(path / "motion.npz")))
+
+    for candidate in sorted(candidates):
+        if candidate.is_dir():
+            candidate = candidate / "motion.npz"
+        if candidate.is_file():
+            return str(candidate)
+
+    raise FileNotFoundError(f"No motion.npz found from motion_path={motion_path}")
+
+
+def get_motion_anchor_body_index(anchor_body_name):
+    try:
+        return ANCHOR_BODY_INDEX_BY_NAME[anchor_body_name]
+    except KeyError as exc:
+        choices = ", ".join(sorted(ANCHOR_BODY_INDEX_BY_NAME))
+        raise ValueError(f"Unsupported anchor_body_name={anchor_body_name}. Known anchors: {choices}") from exc
+
+
 def update_joint_visualization(viewer, motion_loader, t):
     """Update joint visualization spheres using body positions"""
     if t < 0 or t >= motion_loader.T:
@@ -292,7 +490,8 @@ def update_joint_visualization(viewer, motion_loader, t):
 
 # ====== MotionLoader 类（参考 isaaclab） ======
 class MotionLoader:
-    def __init__(self, motion_file):
+    def __init__(self, motion_file, future_steps, anchor_body_name, body_names=None):
+        motion_file = resolve_motion_file(motion_file)
         print(motion_file)
         data = np.load(motion_file)
         self.joint_pos = data["joint_pos"]  # [T, 29]
@@ -306,27 +505,17 @@ class MotionLoader:
         # self.body_pos[..., 2] += 0.015
 
         # G1 body names from the config
-        self.body_names = [
-            "pelvis",
-            "left_hip_roll_link",
-            "left_knee_link",
-            "left_ankle_roll_link",
-            "right_hip_roll_link",
-            "right_knee_link",
-            "right_ankle_roll_link",
-            "torso_link",
-            "left_shoulder_roll_link",
-            "left_elbow_link",
-            "left_wrist_yaw_link",
-            "right_shoulder_roll_link",
-            "right_elbow_link",
-            "right_wrist_yaw_link",
-        ]
-        self.anchor_body_name = anchor_body.name.lower()
-        self.anchor_body_index = anchor_body.value
+        self.body_names = body_names or DEFAULT_BODY_NAMES
+        self.anchor_body_name = anchor_body_name
+        self.anchor_body_index = get_motion_anchor_body_index(anchor_body_name)
+        if self.anchor_body_index >= self.body_pos.shape[1]:
+            raise ValueError(
+                f"Motion body count is {self.body_pos.shape[1]}, but anchor {anchor_body_name} "
+                f"needs index {self.anchor_body_index}."
+            )
 
         # Future steps configuration
-        self.future_steps = 5
+        self.future_steps = future_steps
 
 
 def quat_rotate_inverse_np(q: np.ndarray, v: np.ndarray) -> np.ndarray:
@@ -366,7 +555,7 @@ def quat_rotate_inverse_np(q: np.ndarray, v: np.ndarray) -> np.ndarray:
 def get_command(motion_loader, t):
     """Get command (joint_pos + joint_vel) for future steps - matching Isaac Lab order"""
     if t < 0:
-        return np.zeros(290, dtype=np.float32)  # 29 * 2 * 5 = 290
+        return np.zeros(motion_loader.future_steps * COMMAND_DIM_PER_STEP, dtype=np.float32)
 
     # Get future joint positions and velocities - batch process like Isaac Lab
     future_joint_pos = []
@@ -378,8 +567,8 @@ def get_command(motion_loader, t):
         future_joint_vel.append(motion_loader.joint_vel[step_idx])
 
     # Stack to create [future_steps, 29] then flatten to [future_steps * 29]
-    joint_pos_future = np.stack(future_joint_pos, axis=0).flatten()  # [29 * 5]
-    joint_vel_future = np.stack(future_joint_vel, axis=0).flatten()  # [29 * 5]
+    joint_pos_future = np.stack(future_joint_pos, axis=0).flatten()
+    joint_vel_future = np.stack(future_joint_vel, axis=0).flatten()
     # breakpoint()
 
     cmd = np.concatenate([joint_pos_future, joint_vel_future], axis=0)
@@ -390,7 +579,7 @@ def get_command(motion_loader, t):
 def motion_anchor_pos_b_future(sim_data, motion_loader, t):
     """Future N-step motion anchor position in body frame - matching Isaac Lab order"""
     if t < 0:
-        return np.zeros(15, dtype=np.float32)  # 3 * 5 = 15
+        return np.zeros(motion_loader.future_steps * ANCHOR_POS_DIM_PER_STEP, dtype=np.float32)
 
     # Get robot anchor pose
     robot_pos = sim_data.body(motion_loader.anchor_body_name).xpos.copy().reshape(1, 3)
@@ -429,7 +618,7 @@ def motion_anchor_pos_b_future(sim_data, motion_loader, t):
 def motion_anchor_ori_b_future(sim_data, motion_loader, t):
     """Future N-step motion anchor orientation in body frame - matching Isaac Lab order"""
     if t < 0:
-        return np.zeros(30, dtype=np.float32)  # 6 * 5 = 30
+        return np.zeros(motion_loader.future_steps * ANCHOR_ORI_DIM_PER_STEP, dtype=np.float32)
 
     # Get robot anchor pose
     robot_pos = sim_data.body(motion_loader.anchor_body_name).xpos.copy().reshape(1, 3)
@@ -539,6 +728,18 @@ def robot_body_ori_b(sim_data, motion_loader, t):
     return np.array(mat_flat, dtype=np.float32).flatten()  # [84]
 
 
+def robot_anchor_pos_w(sim_data, motion_loader):
+    """Robot anchor position in world frame."""
+    return sim_data.body(motion_loader.anchor_body_name).xpos.copy().astype(np.float32)
+
+
+def robot_anchor_ori_w(sim_data, motion_loader):
+    """Robot anchor orientation in world frame, represented as first two rows of the rotation matrix."""
+    robot_quat = sim_data.body(motion_loader.anchor_body_name).xquat.copy().reshape(1, 4)
+    mat = matrix_from_quat(torch.from_numpy(robot_quat).float())
+    return np.array(mat[..., :2].reshape(-1), dtype=np.float32)
+
+
 def get_base_lin_vel(sim_data):
     """Get base linear velocity"""
     linvel_b = quat_rotate_inverse_np(sim_data.qpos[3:7], sim_data.qvel[0:3])
@@ -593,16 +794,11 @@ def get_projected_gravity(sim_data):
 #
 
 
-def compute_observation(sim_data, motion_loader, t, last_actions):
-    """Compute observation matching PrivPrivObservationsCfg structure"""
-    # obs_dim = 554
-    obs_dim = 554 - 42 - 84
-    # obs_dim = 160
-    USE_PRIVPRIV_OBS = False
-    # USE_PROJ_GRAV = False
-    USE_PROJ_GRAV = True
-    obs_dim = obs_dim + 42 + 84 if USE_PRIVPRIV_OBS else obs_dim
-    obs_dim = obs_dim + 3 if USE_PROJ_GRAV else obs_dim
+def compute_observation(sim_data, motion_loader, t, last_actions, obs_config="ProjGravObs"):
+    """Compute policy observation in the same order as the Isaac Lab policy group."""
+    obs_dim = compute_observation_dim(motion_loader.future_steps, obs_config)
+    use_proj_grav = _uses_projected_gravity(obs_config)
+    use_robot_anchor = _uses_robot_anchor_obs(obs_config)
 
     if t < 0:
         return np.zeros(obs_dim, dtype=np.float32)
@@ -610,75 +806,74 @@ def compute_observation(sim_data, motion_loader, t, last_actions):
     obs = np.zeros(obs_dim, dtype=np.float32)
     idx = 0
 
-    # 0. command (290,) - future joint pos + vel
+    # 0. command - future joint pos + vel
     command = get_command(motion_loader, t)
     dim_command = command.shape[0]
     obs[idx:idx + dim_command] = command
     idx += dim_command
 
-    # 1. motion_anchor_pos_b (15,) - future anchor pos in body frame
+    # 1. motion_anchor_pos_b - future anchor pos in body frame
     motion_anchor_pos = motion_anchor_pos_b_future(sim_data, motion_loader, t)
     dim_motion_anchor_pos = motion_anchor_pos.shape[0]
     obs[idx:idx + dim_motion_anchor_pos] = motion_anchor_pos
     idx += dim_motion_anchor_pos
 
-    # 2. motion_anchor_ori_b (30,) - future anchor ori in body frame
+    # 2. motion_anchor_ori_b - future anchor ori in body frame
     motion_anchor_ori = motion_anchor_ori_b_future(sim_data, motion_loader, t)
     dim_motion_anchor_ori = motion_anchor_ori.shape[0]
     obs[idx:idx + dim_motion_anchor_ori] = motion_anchor_ori
     idx += dim_motion_anchor_ori
 
-    # breakpoint()
-    if USE_PROJ_GRAV:
-        # 3. projected_gravity (3,) - projected gravity
+    if use_robot_anchor:
+        anchor_pos = robot_anchor_pos_w(sim_data, motion_loader)
+        dim_anchor_pos = anchor_pos.shape[0]
+        obs[idx:idx + dim_anchor_pos] = anchor_pos
+        idx += dim_anchor_pos
+
+        anchor_ori = robot_anchor_ori_w(sim_data, motion_loader)
+        dim_anchor_ori = anchor_ori.shape[0]
+        obs[idx:idx + dim_anchor_ori] = anchor_ori
+        idx += dim_anchor_ori
+
+    if use_proj_grav:
+        # projected_gravity
         projected_gravity = get_projected_gravity(sim_data)
         dim_projected_gravity = projected_gravity.shape[0]
         obs[idx:idx + dim_projected_gravity] = projected_gravity
         idx += dim_projected_gravity
 
-    # if True:
-    if USE_PRIVPRIV_OBS:
-        # 3. body_pos (42,) - robot body pos in body frame
-        body_pos = robot_body_pos_b(sim_data, motion_loader, t)
-        dim_body_pos = body_pos.shape[0]
-        obs[idx:idx + dim_body_pos] = body_pos
-        idx += dim_body_pos
-
-        # 4. body_ori (84,) - robot body ori in body frame
-        body_ori = robot_body_ori_b(sim_data, motion_loader, t)
-        dim_body_ori = body_ori.shape[0]
-        obs[idx:idx + dim_body_ori] = body_ori
-        idx += dim_body_ori
-
-    # 5. base_lin_vel (3,) - base linear velocity
+    # base_lin_vel
     base_lin_vel = get_base_lin_vel(sim_data)
     dim_base_lin_vel = base_lin_vel.shape[0]
     obs[idx:idx + dim_base_lin_vel] = base_lin_vel
     idx += dim_base_lin_vel
 
-    # 6. base_ang_vel (3,) - base angular velocity
+    # base_ang_vel
     base_ang_vel = get_base_ang_vel(sim_data)
     dim_base_ang_vel = base_ang_vel.shape[0]
     obs[idx:idx + dim_base_ang_vel] = base_ang_vel
     idx += dim_base_ang_vel
 
-    # 7. joint_pos (29,) - relative joint positions
+    # joint_pos
     joint_pos = get_joint_pos_rel(sim_data)[mujoco_to_isaaclab_reindex]
     dim_joint_pos = joint_pos.shape[0]
     obs[idx:idx + dim_joint_pos] = joint_pos
     idx += dim_joint_pos
 
-    # 8. joint_vel (29,) - relative joint velocities
+    # joint_vel
     joint_vel = get_joint_vel_rel(sim_data)[mujoco_to_isaaclab_reindex]
     dim_joint_vel = joint_vel.shape[0]
     obs[idx:idx + dim_joint_vel] = joint_vel
     idx += dim_joint_vel
 
-    # 9. actions (29,) - last actions
+    # actions
     last_action = get_last_action(last_actions)
     dim_last_action = last_action.shape[0]
     obs[idx:idx + dim_last_action] = last_action
     idx += dim_last_action
+
+    if idx != obs_dim:
+        raise RuntimeError(f"Observation assembly produced dim {idx}, expected {obs_dim}.")
 
     return obs
 
@@ -699,6 +894,9 @@ if __name__ == "__main__":
         default="",
         help="Path to policy file (.onnx)",
     )
+    parser.add_argument("--future_steps", type=int, default=None, help="Future steps used by the exported policy.")
+    parser.add_argument("--obs_config", type=str, default="ProjGravObs", help="Observation config used during training.")
+    parser.add_argument("--anchor_body_name", type=str, default=None, help="Anchor body name used by the motion command.")
 
     args = parser.parse_args()
     print(args)
@@ -731,12 +929,37 @@ if __name__ == "__main__":
     m.opt.timestep = simulation_dt
 
     # load policy
+    ort = load_onnxruntime()
     session = ort.InferenceSession(policy_path)
     obs_name = session.get_inputs()[0].name
+    policy_metadata = get_policy_metadata(session)
+    policy_input_dim = get_policy_input_dim(session)
 
-    motion_loader = MotionLoader(motion_path)
+    anchor_body_name = args.anchor_body_name or policy_metadata.get("anchor_body_name", "pelvis")
+    body_names = _csv_metadata_list(policy_metadata.get("body_names")) or DEFAULT_BODY_NAMES
+    future_steps = args.future_steps
+    if future_steps is None:
+        future_steps = infer_future_steps_from_input_dim(policy_input_dim, args.obs_config)
+    if future_steps is None:
+        raise ValueError("Unable to infer future_steps from ONNX input shape. Please pass --future_steps explicitly.")
+    expected_obs_dim = compute_observation_dim(future_steps, args.obs_config)
+    if policy_input_dim is not None and policy_input_dim != expected_obs_dim:
+        raise ValueError(
+            f"Deploy observation dim {expected_obs_dim} does not match ONNX input dim {policy_input_dim}. "
+            f"Check --future_steps and --obs_config."
+        )
+
+    motion_loader = MotionLoader(
+        motion_path,
+        future_steps=future_steps,
+        anchor_body_name=anchor_body_name,
+        body_names=body_names,
+    )
     T = motion_loader.T
     print("obs dim: ", session.get_inputs()[0])
+    print("deploy obs_config:", args.obs_config)
+    print("deploy future_steps:", future_steps)
+    print("deploy anchor_body_name:", anchor_body_name)
     print("T: ", T)
     print()
 
@@ -775,8 +998,12 @@ if __name__ == "__main__":
             # breakpoint()
 
             print("t: ", inner_counter, "/", T, end='\r')
-            obs = compute_observation(d, motion_loader, inner_counter, action)
+            obs = compute_observation(d, motion_loader, inner_counter, action, args.obs_config)
             obs_tensor = np.array(obs, dtype=np.float32).reshape(1, -1)
+            if policy_input_dim is not None and obs_tensor.shape[1] != policy_input_dim:
+                raise RuntimeError(
+                    f"Computed obs dim {obs_tensor.shape[1]} does not match ONNX input dim {policy_input_dim}."
+                )
 
             output = session.run(None, {obs_name: obs_tensor})
             action = output[0].squeeze()
