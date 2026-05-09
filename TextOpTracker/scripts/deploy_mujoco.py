@@ -103,6 +103,58 @@ JOINT_POS_DIM = NUM_ACTIONS
 JOINT_VEL_DIM = NUM_ACTIONS
 LAST_ACTION_DIM = NUM_ACTIONS
 
+TASK_AUTO = "auto"
+TASK_PROJ_GRAV_OBS = "Tracking-Flat-G1-ProjGravObs-MNMLP-v0"
+TASK_PROJ_GRAV_ANCHOR_OBS = "Tracking-Flat-G1-ProjGravAnchorObs-NMMLP-v0"
+SUPPORTED_TASKS = (
+    TASK_PROJ_GRAV_OBS,
+    TASK_PROJ_GRAV_ANCHOR_OBS,
+)
+
+PROJ_GRAV_OBS_TERMS = (
+    "command",
+    "motion_anchor_pos_b",
+    "motion_anchor_ori_b",
+    "projected_gravity",
+    "base_lin_vel",
+    "base_ang_vel",
+    "joint_pos",
+    "joint_vel",
+    "actions",
+)
+PROJ_GRAV_ANCHOR_OBS_TERMS = (
+    "command",
+    "motion_anchor_pos_b",
+    "motion_anchor_ori_b",
+    "robot_anchor_pos_w",
+    "robot_anchor_ori_w",
+    "projected_gravity",
+    "base_lin_vel",
+    "base_ang_vel",
+    "joint_pos",
+    "joint_vel",
+    "actions",
+)
+TASK_OBSERVATION_TERMS = {
+    TASK_PROJ_GRAV_OBS: PROJ_GRAV_OBS_TERMS,
+    TASK_PROJ_GRAV_ANCHOR_OBS: PROJ_GRAV_ANCHOR_OBS_TERMS,
+}
+FUTURE_TERM_DIMS = {
+    "command": COMMAND_DIM_PER_STEP,
+    "motion_anchor_pos_b": ANCHOR_POS_DIM_PER_STEP,
+    "motion_anchor_ori_b": ANCHOR_ORI_DIM_PER_STEP,
+}
+FIXED_TERM_DIMS = {
+    "projected_gravity": PROJECTED_GRAVITY_DIM,
+    "robot_anchor_pos_w": ROBOT_ANCHOR_POS_DIM,
+    "robot_anchor_ori_w": ROBOT_ANCHOR_ORI_DIM,
+    "base_lin_vel": BASE_LIN_VEL_DIM,
+    "base_ang_vel": BASE_ANG_VEL_DIM,
+    "joint_pos": JOINT_POS_DIM,
+    "joint_vel": JOINT_VEL_DIM,
+    "actions": LAST_ACTION_DIM,
+}
+
 
 # 定义枚举类型
 class AnchorBody(Enum):
@@ -410,25 +462,85 @@ def _uses_robot_anchor_obs(obs_config):
     return "AnchorObs" in obs_config
 
 
-def compute_observation_dim(future_steps, obs_config="ProjGravObs"):
-    future_dim = future_steps * (COMMAND_DIM_PER_STEP + ANCHOR_POS_DIM_PER_STEP + ANCHOR_ORI_DIM_PER_STEP)
-    fixed_dim = BASE_LIN_VEL_DIM + BASE_ANG_VEL_DIM + JOINT_POS_DIM + JOINT_VEL_DIM + LAST_ACTION_DIM
-    if _uses_projected_gravity(obs_config):
-        fixed_dim += PROJECTED_GRAVITY_DIM
+def infer_task_from_observation_names(observation_names):
+    names = tuple(observation_names or ())
+    if not names:
+        return None
+    for task, terms in TASK_OBSERVATION_TERMS.items():
+        if names == terms:
+            return task
+    if "robot_anchor_pos_w" in names or "robot_anchor_ori_w" in names:
+        return TASK_PROJ_GRAV_ANCHOR_OBS
+    if "projected_gravity" in names:
+        return TASK_PROJ_GRAV_OBS
+    return None
+
+
+def task_from_obs_config(obs_config):
+    if obs_config in TASK_OBSERVATION_TERMS:
+        return obs_config
     if _uses_robot_anchor_obs(obs_config):
-        fixed_dim += ROBOT_ANCHOR_POS_DIM + ROBOT_ANCHOR_ORI_DIM
-    return future_dim + fixed_dim
+        return TASK_PROJ_GRAV_ANCHOR_OBS
+    if _uses_projected_gravity(obs_config):
+        return TASK_PROJ_GRAV_OBS
+    raise ValueError(f"Unsupported obs_config={obs_config}. Please pass --task explicitly.")
 
 
-def infer_future_steps_from_input_dim(input_dim, obs_config="ProjGravObs"):
+def resolve_task(task=TASK_AUTO, policy_metadata=None, obs_config="ProjGravObs"):
+    if task != TASK_AUTO:
+        if task not in TASK_OBSERVATION_TERMS:
+            choices = ", ".join(SUPPORTED_TASKS)
+            raise ValueError(f"Unsupported task={task}. Supported tasks: {choices}")
+        return task
+
+    metadata_obs_names = []
+    if policy_metadata:
+        metadata_obs_names = _csv_metadata_list(policy_metadata.get("observation_names"))
+    inferred_task = infer_task_from_observation_names(metadata_obs_names)
+    if inferred_task is not None:
+        return inferred_task
+    return task_from_obs_config(obs_config)
+
+
+def get_observation_terms(task=None, obs_config="ProjGravObs", observation_terms=None):
+    if observation_terms is not None:
+        return tuple(observation_terms)
+    resolved_task = task or task_from_obs_config(obs_config)
+    try:
+        return TASK_OBSERVATION_TERMS[resolved_task]
+    except KeyError as exc:
+        choices = ", ".join(SUPPORTED_TASKS)
+        raise ValueError(f"Unsupported task={resolved_task}. Supported tasks: {choices}") from exc
+
+
+def _term_dims(observation_terms):
+    fixed_dim = 0
+    per_step_dim = 0
+    for term in observation_terms:
+        if term in FUTURE_TERM_DIMS:
+            per_step_dim += FUTURE_TERM_DIMS[term]
+        elif term in FIXED_TERM_DIMS:
+            fixed_dim += FIXED_TERM_DIMS[term]
+        else:
+            raise ValueError(f"Unsupported observation term={term}")
+    return fixed_dim, per_step_dim
+
+
+def compute_observation_dim(future_steps, obs_config="ProjGravObs", task=None, observation_terms=None):
+    terms = get_observation_terms(task=task, obs_config=obs_config, observation_terms=observation_terms)
+    fixed_dim, per_step_dim = _term_dims(terms)
+    return future_steps * per_step_dim + fixed_dim
+
+
+def infer_future_steps_from_input_dim(input_dim, obs_config="ProjGravObs", task=None, observation_terms=None):
     if input_dim is None:
         return None
-    fixed_dim = compute_observation_dim(0, obs_config)
-    per_step_dim = COMMAND_DIM_PER_STEP + ANCHOR_POS_DIM_PER_STEP + ANCHOR_ORI_DIM_PER_STEP
+    terms = get_observation_terms(task=task, obs_config=obs_config, observation_terms=observation_terms)
+    fixed_dim, per_step_dim = _term_dims(terms)
     remainder = input_dim - fixed_dim
     if remainder <= 0 or remainder % per_step_dim != 0:
         raise ValueError(
-            f"Cannot infer future_steps from ONNX input dim {input_dim} with obs_config={obs_config}. "
+            f"Cannot infer future_steps from ONNX input dim {input_dim} with task={task}, obs_config={obs_config}. "
             f"Fixed dim={fixed_dim}, per-step dim={per_step_dim}."
         )
     return remainder // per_step_dim
@@ -794,86 +906,57 @@ def get_projected_gravity(sim_data):
 #
 
 
-def compute_observation(sim_data, motion_loader, t, last_actions, obs_config="ProjGravObs"):
+def compute_observation_term(term, sim_data, motion_loader, t, last_actions):
+    """Compute one policy observation term in Isaac Lab policy order."""
+    if term == "command":
+        return get_command(motion_loader, t)
+    if term == "motion_anchor_pos_b":
+        return motion_anchor_pos_b_future(sim_data, motion_loader, t)
+    if term == "motion_anchor_ori_b":
+        return motion_anchor_ori_b_future(sim_data, motion_loader, t)
+    if term == "robot_anchor_pos_w":
+        return robot_anchor_pos_w(sim_data, motion_loader)
+    if term == "robot_anchor_ori_w":
+        return robot_anchor_ori_w(sim_data, motion_loader)
+    if term == "projected_gravity":
+        return get_projected_gravity(sim_data)
+    if term == "base_lin_vel":
+        return get_base_lin_vel(sim_data)
+    if term == "base_ang_vel":
+        return get_base_ang_vel(sim_data)
+    if term == "joint_pos":
+        return get_joint_pos_rel(sim_data)[mujoco_to_isaaclab_reindex]
+    if term == "joint_vel":
+        return get_joint_vel_rel(sim_data)[mujoco_to_isaaclab_reindex]
+    if term == "actions":
+        return get_last_action(last_actions)
+    raise ValueError(f"Unsupported observation term={term}")
+
+
+def compute_observation(
+    sim_data,
+    motion_loader,
+    t,
+    last_actions,
+    obs_config="ProjGravObs",
+    task=None,
+    observation_terms=None,
+):
     """Compute policy observation in the same order as the Isaac Lab policy group."""
-    obs_dim = compute_observation_dim(motion_loader.future_steps, obs_config)
-    use_proj_grav = _uses_projected_gravity(obs_config)
-    use_robot_anchor = _uses_robot_anchor_obs(obs_config)
+    terms = get_observation_terms(task=task, obs_config=obs_config, observation_terms=observation_terms)
+    obs_dim = compute_observation_dim(motion_loader.future_steps, obs_config, task=task, observation_terms=terms)
 
     if t < 0:
         return np.zeros(obs_dim, dtype=np.float32)
 
-    obs = np.zeros(obs_dim, dtype=np.float32)
-    idx = 0
+    pieces = [
+        np.asarray(compute_observation_term(term, sim_data, motion_loader, t, last_actions), dtype=np.float32).reshape(-1)
+        for term in terms
+    ]
+    obs = np.concatenate(pieces, axis=0).astype(np.float32, copy=False)
 
-    # 0. command - future joint pos + vel
-    command = get_command(motion_loader, t)
-    dim_command = command.shape[0]
-    obs[idx:idx + dim_command] = command
-    idx += dim_command
-
-    # 1. motion_anchor_pos_b - future anchor pos in body frame
-    motion_anchor_pos = motion_anchor_pos_b_future(sim_data, motion_loader, t)
-    dim_motion_anchor_pos = motion_anchor_pos.shape[0]
-    obs[idx:idx + dim_motion_anchor_pos] = motion_anchor_pos
-    idx += dim_motion_anchor_pos
-
-    # 2. motion_anchor_ori_b - future anchor ori in body frame
-    motion_anchor_ori = motion_anchor_ori_b_future(sim_data, motion_loader, t)
-    dim_motion_anchor_ori = motion_anchor_ori.shape[0]
-    obs[idx:idx + dim_motion_anchor_ori] = motion_anchor_ori
-    idx += dim_motion_anchor_ori
-
-    if use_robot_anchor:
-        anchor_pos = robot_anchor_pos_w(sim_data, motion_loader)
-        dim_anchor_pos = anchor_pos.shape[0]
-        obs[idx:idx + dim_anchor_pos] = anchor_pos
-        idx += dim_anchor_pos
-
-        anchor_ori = robot_anchor_ori_w(sim_data, motion_loader)
-        dim_anchor_ori = anchor_ori.shape[0]
-        obs[idx:idx + dim_anchor_ori] = anchor_ori
-        idx += dim_anchor_ori
-
-    if use_proj_grav:
-        # projected_gravity
-        projected_gravity = get_projected_gravity(sim_data)
-        dim_projected_gravity = projected_gravity.shape[0]
-        obs[idx:idx + dim_projected_gravity] = projected_gravity
-        idx += dim_projected_gravity
-
-    # base_lin_vel
-    base_lin_vel = get_base_lin_vel(sim_data)
-    dim_base_lin_vel = base_lin_vel.shape[0]
-    obs[idx:idx + dim_base_lin_vel] = base_lin_vel
-    idx += dim_base_lin_vel
-
-    # base_ang_vel
-    base_ang_vel = get_base_ang_vel(sim_data)
-    dim_base_ang_vel = base_ang_vel.shape[0]
-    obs[idx:idx + dim_base_ang_vel] = base_ang_vel
-    idx += dim_base_ang_vel
-
-    # joint_pos
-    joint_pos = get_joint_pos_rel(sim_data)[mujoco_to_isaaclab_reindex]
-    dim_joint_pos = joint_pos.shape[0]
-    obs[idx:idx + dim_joint_pos] = joint_pos
-    idx += dim_joint_pos
-
-    # joint_vel
-    joint_vel = get_joint_vel_rel(sim_data)[mujoco_to_isaaclab_reindex]
-    dim_joint_vel = joint_vel.shape[0]
-    obs[idx:idx + dim_joint_vel] = joint_vel
-    idx += dim_joint_vel
-
-    # actions
-    last_action = get_last_action(last_actions)
-    dim_last_action = last_action.shape[0]
-    obs[idx:idx + dim_last_action] = last_action
-    idx += dim_last_action
-
-    if idx != obs_dim:
-        raise RuntimeError(f"Observation assembly produced dim {idx}, expected {obs_dim}.")
+    if obs.shape[0] != obs_dim:
+        raise RuntimeError(f"Observation assembly produced dim {obs.shape[0]}, expected {obs_dim}.")
 
     return obs
 
@@ -896,6 +979,13 @@ if __name__ == "__main__":
     )
     parser.add_argument("--future_steps", type=int, default=None, help="Future steps used by the exported policy.")
     parser.add_argument("--obs_config", type=str, default="ProjGravObs", help="Observation config used during training.")
+    parser.add_argument(
+        "--task",
+        type=str,
+        default=TASK_AUTO,
+        choices=(TASK_AUTO, *SUPPORTED_TASKS),
+        help="Training task that defines the deploy observation layout. Use auto to infer from ONNX metadata.",
+    )
     parser.add_argument("--anchor_body_name", type=str, default=None, help="Anchor body name used by the motion command.")
 
     args = parser.parse_args()
@@ -934,19 +1024,32 @@ if __name__ == "__main__":
     obs_name = session.get_inputs()[0].name
     policy_metadata = get_policy_metadata(session)
     policy_input_dim = get_policy_input_dim(session)
+    task = resolve_task(args.task, policy_metadata=policy_metadata, obs_config=args.obs_config)
+    observation_terms = get_observation_terms(task=task)
 
     anchor_body_name = args.anchor_body_name or policy_metadata.get("anchor_body_name", "pelvis")
     body_names = _csv_metadata_list(policy_metadata.get("body_names")) or DEFAULT_BODY_NAMES
     future_steps = args.future_steps
     if future_steps is None:
-        future_steps = infer_future_steps_from_input_dim(policy_input_dim, args.obs_config)
+        future_steps = infer_future_steps_from_input_dim(
+            policy_input_dim,
+            obs_config=args.obs_config,
+            task=task,
+            observation_terms=observation_terms,
+        )
     if future_steps is None:
         raise ValueError("Unable to infer future_steps from ONNX input shape. Please pass --future_steps explicitly.")
-    expected_obs_dim = compute_observation_dim(future_steps, args.obs_config)
+    expected_obs_dim = compute_observation_dim(
+        future_steps,
+        obs_config=args.obs_config,
+        task=task,
+        observation_terms=observation_terms,
+    )
     if policy_input_dim is not None and policy_input_dim != expected_obs_dim:
         raise ValueError(
             f"Deploy observation dim {expected_obs_dim} does not match ONNX input dim {policy_input_dim}. "
-            f"Check --future_steps and --obs_config."
+            f"task={task}, future_steps={future_steps}, obs_config={args.obs_config}. "
+            f"Check --task and --future_steps."
         )
 
     motion_loader = MotionLoader(
@@ -957,7 +1060,9 @@ if __name__ == "__main__":
     )
     T = motion_loader.T
     print("obs dim: ", session.get_inputs()[0])
+    print("deploy task:", task)
     print("deploy obs_config:", args.obs_config)
+    print("deploy observation terms:", ",".join(observation_terms))
     print("deploy future_steps:", future_steps)
     print("deploy anchor_body_name:", anchor_body_name)
     print("T: ", T)
@@ -998,7 +1103,15 @@ if __name__ == "__main__":
             # breakpoint()
 
             print("t: ", inner_counter, "/", T, end='\r')
-            obs = compute_observation(d, motion_loader, inner_counter, action, args.obs_config)
+            obs = compute_observation(
+                d,
+                motion_loader,
+                inner_counter,
+                action,
+                obs_config=args.obs_config,
+                task=task,
+                observation_terms=observation_terms,
+            )
             obs_tensor = np.array(obs, dtype=np.float32).reshape(1, -1)
             if policy_input_dim is not None and obs_tensor.shape[1] != policy_input_dim:
                 raise RuntimeError(

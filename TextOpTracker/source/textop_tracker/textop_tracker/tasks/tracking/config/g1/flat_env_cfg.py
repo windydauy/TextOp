@@ -138,6 +138,16 @@ class G1FlatProjGravAnchorObsEnvCfg(G1FlatEnvCfg):
 
 
 @configclass
+class G1FlatProjGravAnchorObsMotionAEEnvCfg(G1FlatProjGravAnchorObsEnvCfg):
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.commands.motion.future_steps = 10
+        self.commands.motion.motion_ae_enabled = True
+        self.commands.motion.motion_ae_latent_mode = "z_dequant"
+
+
+@configclass
 class G1FlatLowFreqEnvCfg(G1FlatEnvCfg):
 
     def __post_init__(self):
