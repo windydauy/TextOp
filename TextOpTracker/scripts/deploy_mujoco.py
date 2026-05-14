@@ -110,11 +110,13 @@ TASK_AUTO = "auto"
 TASK_PROJ_GRAV_OBS = "Tracking-Flat-G1-ProjGravObs-MNMLP-v0"
 TASK_PROJ_GRAV_ANCHOR_OBS = "Tracking-Flat-G1-ProjGravAnchorObs-NMMLP-v0"
 TASK_PROJ_GRAV_ANCHOR_OBS_MOTION_AE = "Tracking-Flat-G1-ProjGravAnchorObs-MotionAE-NMMLP-v0"
+TASK_PROJ_GRAV_ANCHOR_EE_OBS = "Tracking-Flat-G1-ProjGravAnchorEEObs-NMMLP-v0"
 TASK_PROJ_GRAV_ANCHOR_OBS_TRANSFORMER_VAE = "Tracking-Flat-G1-ProjGravAnchorObs-TransformerVAE-NMMLP-v0"
 SUPPORTED_TASKS = (
     TASK_PROJ_GRAV_OBS,
     TASK_PROJ_GRAV_ANCHOR_OBS,
     TASK_PROJ_GRAV_ANCHOR_OBS_MOTION_AE,
+    TASK_PROJ_GRAV_ANCHOR_EE_OBS,
     TASK_PROJ_GRAV_ANCHOR_OBS_TRANSFORMER_VAE,
 )
 
@@ -142,15 +144,33 @@ PROJ_GRAV_ANCHOR_OBS_TERMS = (
     "joint_vel",
     "actions",
 )
+PROJ_GRAV_ANCHOR_EE_OBS_TERMS = (
+    "command",
+    "motion_anchor_pos_b",
+    "motion_anchor_ori_b",
+    "robot_anchor_pos_w",
+    "robot_anchor_ori_w",
+    "motion_ee_pos_b",
+    "motion_ee_ori_b",
+    "projected_gravity",
+    "base_lin_vel",
+    "base_ang_vel",
+    "joint_pos",
+    "joint_vel",
+    "actions",
+)
 TASK_OBSERVATION_TERMS = {
     TASK_PROJ_GRAV_OBS: PROJ_GRAV_OBS_TERMS,
     TASK_PROJ_GRAV_ANCHOR_OBS: PROJ_GRAV_ANCHOR_OBS_TERMS,
     TASK_PROJ_GRAV_ANCHOR_OBS_MOTION_AE: PROJ_GRAV_ANCHOR_OBS_TERMS,
+    TASK_PROJ_GRAV_ANCHOR_EE_OBS: PROJ_GRAV_ANCHOR_EE_OBS_TERMS,
     TASK_PROJ_GRAV_ANCHOR_OBS_TRANSFORMER_VAE: PROJ_GRAV_ANCHOR_OBS_TERMS,
 }
 FUTURE_TERM_DIMS = {
     "motion_anchor_pos_b": ANCHOR_POS_DIM_PER_STEP,
     "motion_anchor_ori_b": ANCHOR_ORI_DIM_PER_STEP,
+    "motion_ee_pos_b": 4 * 3,
+    "motion_ee_ori_b": 4 * 6,
 }
 FIXED_TERM_DIMS = {
     "projected_gravity": PROJECTED_GRAVITY_DIM,
@@ -212,6 +232,13 @@ DEFAULT_BODY_NAMES = [
     "right_shoulder_roll_link",
     "right_elbow_link",
     "right_wrist_yaw_link",
+]
+
+DEFAULT_EE_BODY_NAMES = [
+    "left_wrist_yaw_link",
+    "right_wrist_yaw_link",
+    "left_ankle_roll_link",
+    "right_ankle_roll_link",
 ]
 
 isaaclab_joint_names = [
@@ -467,6 +494,15 @@ def _csv_metadata_list(value):
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def _decode_body_names(raw_names):
+    if raw_names is None:
+        return []
+    return [
+        item.decode("utf-8") if isinstance(item, (bytes, np.bytes_)) else str(item)
+        for item in raw_names
+    ]
+
+
 def get_policy_metadata(session):
     try:
         return dict(session.get_modelmeta().custom_metadata_map)
@@ -498,11 +534,15 @@ def _candidate_tasks_from_observation_names(observation_names):
     if candidates:
         return candidates
     if "robot_anchor_pos_w" in names or "robot_anchor_ori_w" in names:
-        return [
+        candidates = [
             TASK_PROJ_GRAV_ANCHOR_OBS,
             TASK_PROJ_GRAV_ANCHOR_OBS_MOTION_AE,
+            TASK_PROJ_GRAV_ANCHOR_EE_OBS,
             TASK_PROJ_GRAV_ANCHOR_OBS_TRANSFORMER_VAE,
         ]
+        if "motion_ee_pos_b" in names or "motion_ee_ori_b" in names:
+            return [TASK_PROJ_GRAV_ANCHOR_EE_OBS]
+        return candidates
     if "projected_gravity" in names:
         return [TASK_PROJ_GRAV_OBS]
     return []
@@ -531,6 +571,8 @@ def infer_task_from_observation_names(observation_names, input_dim=None, future_
 def task_from_obs_config(obs_config):
     if obs_config in TASK_OBSERVATION_TERMS:
         return obs_config
+    if "EEObs" in obs_config:
+        return TASK_PROJ_GRAV_ANCHOR_EE_OBS
     if _uses_robot_anchor_obs(obs_config):
         return TASK_PROJ_GRAV_ANCHOR_OBS
     if _uses_projected_gravity(obs_config):
@@ -574,7 +616,7 @@ def _term_dims(observation_terms, task=None):
     per_step_dim = 0
     for term in observation_terms:
         if term == "command":
-            if task == TASK_PROJ_GRAV_ANCHOR_OBS_MOTION_AE:
+            if task in (TASK_PROJ_GRAV_ANCHOR_OBS_MOTION_AE, TASK_PROJ_GRAV_ANCHOR_EE_OBS):
                 fixed_dim += MOTION_AE_LATENT_DIM
             elif task == TASK_PROJ_GRAV_ANCHOR_OBS_TRANSFORMER_VAE:
                 fixed_dim += MOTION_TRANSFORMER_VAE_LATENT_DIM
@@ -879,7 +921,12 @@ class MotionLoader:
         # G1 body names from the config
         self.body_names = body_names or DEFAULT_BODY_NAMES
         self.anchor_body_name = anchor_body_name
-        self.anchor_body_index = get_motion_anchor_body_index(anchor_body_name)
+        motion_body_names = _decode_body_names(data["body_names"]) if "body_names" in data.files else []
+        if motion_body_names:
+            self.motion_body_index_by_name = {name: i for i, name in enumerate(motion_body_names)}
+        else:
+            self.motion_body_index_by_name = {name: i for i, name in enumerate(DEFAULT_BODY_NAMES)}
+        self.anchor_body_index = self.motion_body_index(anchor_body_name)
         if self.anchor_body_index >= self.body_pos.shape[1]:
             raise ValueError(
                 f"Motion body count is {self.body_pos.shape[1]}, but anchor {anchor_body_name} "
@@ -914,6 +961,11 @@ class MotionLoader:
                     "MotionTransformerVAE latent length mismatch: "
                     f"{self.motion_ae_latents.shape[0]} vs motion frames {self.T}"
                 )
+
+    def motion_body_index(self, body_name):
+        if body_name in self.motion_body_index_by_name:
+            return self.motion_body_index_by_name[body_name]
+        return get_motion_anchor_body_index(body_name)
 
 
 def quat_rotate_inverse_np(q: np.ndarray, v: np.ndarray) -> np.ndarray:
@@ -1060,6 +1112,71 @@ def motion_anchor_ori_b_future(sim_data, motion_loader, t):
     ori_b_flat = np.array(mat_flat, dtype=np.float32).flatten()  # [30]
     # breakpoint()
     return ori_b_flat  # [30]
+
+
+def motion_body_pos_b_future(sim_data, motion_loader, t, body_names):
+    """Future N-step reference body positions in robot anchor frame."""
+    if t < 0:
+        return np.zeros(motion_loader.future_steps * len(body_names) * 3, dtype=np.float32)
+
+    robot_pos = sim_data.body(motion_loader.anchor_body_name).xpos.copy().reshape(1, 1, 3)
+    robot_quat = sim_data.body(motion_loader.anchor_body_name).xquat.copy().reshape(1, 1, 4)
+    body_indexes = [motion_loader.motion_body_index(name) for name in body_names]
+
+    future_positions = []
+    future_orientations = []
+    for i in range(motion_loader.future_steps):
+        step_idx = min(t + i, motion_loader.T - 1)
+        future_positions.append(motion_loader.body_pos[step_idx, body_indexes])
+        future_orientations.append(motion_loader.body_ori[step_idx, body_indexes])
+
+    future_body_pos_w = np.stack(future_positions, axis=0)
+    future_body_quat_w = np.stack(future_orientations, axis=0)
+    robot_anchor_pos_w_exp = np.repeat(robot_pos, motion_loader.future_steps, axis=0)
+    robot_anchor_pos_w_exp = np.repeat(robot_anchor_pos_w_exp, len(body_names), axis=1)
+    robot_anchor_quat_w_exp = np.repeat(robot_quat, motion_loader.future_steps, axis=0)
+    robot_anchor_quat_w_exp = np.repeat(robot_anchor_quat_w_exp, len(body_names), axis=1)
+
+    pos_b, _ = subtract_frame_transforms(
+        torch.from_numpy(robot_anchor_pos_w_exp).float(),
+        torch.from_numpy(robot_anchor_quat_w_exp).float(),
+        torch.from_numpy(future_body_pos_w).float(),
+        torch.from_numpy(future_body_quat_w).float(),
+    )
+    return np.array(pos_b, dtype=np.float32).reshape(-1)
+
+
+def motion_body_ori_b_future(sim_data, motion_loader, t, body_names):
+    """Future N-step reference body orientations in robot anchor frame, as 6D rotation."""
+    if t < 0:
+        return np.zeros(motion_loader.future_steps * len(body_names) * 6, dtype=np.float32)
+
+    robot_pos = sim_data.body(motion_loader.anchor_body_name).xpos.copy().reshape(1, 1, 3)
+    robot_quat = sim_data.body(motion_loader.anchor_body_name).xquat.copy().reshape(1, 1, 4)
+    body_indexes = [motion_loader.motion_body_index(name) for name in body_names]
+
+    future_positions = []
+    future_orientations = []
+    for i in range(motion_loader.future_steps):
+        step_idx = min(t + i, motion_loader.T - 1)
+        future_positions.append(motion_loader.body_pos[step_idx, body_indexes])
+        future_orientations.append(motion_loader.body_ori[step_idx, body_indexes])
+
+    future_body_pos_w = np.stack(future_positions, axis=0)
+    future_body_quat_w = np.stack(future_orientations, axis=0)
+    robot_anchor_pos_w_exp = np.repeat(robot_pos, motion_loader.future_steps, axis=0)
+    robot_anchor_pos_w_exp = np.repeat(robot_anchor_pos_w_exp, len(body_names), axis=1)
+    robot_anchor_quat_w_exp = np.repeat(robot_quat, motion_loader.future_steps, axis=0)
+    robot_anchor_quat_w_exp = np.repeat(robot_anchor_quat_w_exp, len(body_names), axis=1)
+
+    _, ori_b = subtract_frame_transforms(
+        torch.from_numpy(robot_anchor_pos_w_exp).float(),
+        torch.from_numpy(robot_anchor_quat_w_exp).float(),
+        torch.from_numpy(future_body_pos_w).float(),
+        torch.from_numpy(future_body_quat_w).float(),
+    )
+    mat = matrix_from_quat(ori_b)
+    return np.array(mat[..., :2].reshape(-1), dtype=np.float32)
 
 
 def robot_body_pos_b(sim_data, motion_loader, t):
@@ -1210,6 +1327,10 @@ def compute_observation_term(term, sim_data, motion_loader, t, last_actions):
         return robot_anchor_pos_w(sim_data, motion_loader)
     if term == "robot_anchor_ori_w":
         return robot_anchor_ori_w(sim_data, motion_loader)
+    if term == "motion_ee_pos_b":
+        return motion_body_pos_b_future(sim_data, motion_loader, t, DEFAULT_EE_BODY_NAMES)
+    if term == "motion_ee_ori_b":
+        return motion_body_ori_b_future(sim_data, motion_loader, t, DEFAULT_EE_BODY_NAMES)
     if term == "projected_gravity":
         return get_projected_gravity(sim_data)
     if term == "base_lin_vel":
@@ -1378,7 +1499,7 @@ if __name__ == "__main__":
 
     motion_ae_adapter = None
     motion_transformer_vae_adapter = None
-    if task == TASK_PROJ_GRAV_ANCHOR_OBS_MOTION_AE:
+    if task in (TASK_PROJ_GRAV_ANCHOR_OBS_MOTION_AE, TASK_PROJ_GRAV_ANCHOR_EE_OBS):
         motion_ae_adapter = MotionAEOnnxLatentAdapter(
             project_root=args.motion_ae_project_root,
             config_path=args.motion_ae_config_path,

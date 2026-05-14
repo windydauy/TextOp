@@ -317,6 +317,38 @@ class ProjGravAnchorObsObservationsCfg:
 
 
 @configclass
+class ProjGravAnchorEEObsObservationsCfg(ProjGravAnchorObsObservationsCfg):
+    """ProjGrav anchor observations with future EE reference targets."""
+
+    @configclass
+    class PolicyCfg(ProjGravAnchorObsObservationsCfg.PolicyCfg):
+        motion_ee_pos_b = ObsTerm(
+            func=mdp.motion_body_pos_b_future,
+            params={"command_name": "motion", "body_names": _EE_BODY_NAMES},
+            noise=Unoise(n_min=-0.1, n_max=0.1),
+        )
+        motion_ee_ori_b = ObsTerm(
+            func=mdp.motion_body_ori_b_future,
+            params={"command_name": "motion", "body_names": _EE_BODY_NAMES},
+            noise=Unoise(n_min=-0.05, n_max=0.05),
+        )
+
+    @configclass
+    class PrivilegedCfg(ProjGravAnchorObsObservationsCfg.PrivilegedCfg):
+        motion_ee_pos_b = ObsTerm(
+            func=mdp.motion_body_pos_b_future,
+            params={"command_name": "motion", "body_names": _EE_BODY_NAMES},
+        )
+        motion_ee_ori_b = ObsTerm(
+            func=mdp.motion_body_ori_b_future,
+            params={"command_name": "motion", "body_names": _EE_BODY_NAMES},
+        )
+
+    policy: PolicyCfg = PolicyCfg()
+    critic: PrivilegedCfg = PrivilegedCfg()
+
+
+@configclass
 class PropPropObservationsCfg:
     """Observation specifications for the MDP."""
     @configclass

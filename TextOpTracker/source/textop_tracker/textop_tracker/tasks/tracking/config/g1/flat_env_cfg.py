@@ -2,7 +2,7 @@ from isaaclab.utils import configclass
 
 from textop_tracker.robots.g1 import G1_ACTION_SCALE, G1_CYLINDER_CFG
 from textop_tracker.tasks.tracking.config.g1.agents.rsl_rl_ppo_cfg import LOW_FREQ_SCALE
-from textop_tracker.tasks.tracking.tracking_env_cfg import TrackingEnvCfg, PrivPrivObservationsCfg, PropPropObservationsCfg, NoisePrivObservationsCfg, ProjGravObservationsCfg, ProjGravAnchorObsObservationsCfg
+from textop_tracker.tasks.tracking.tracking_env_cfg import TrackingEnvCfg, PrivPrivObservationsCfg, PropPropObservationsCfg, NoisePrivObservationsCfg, ProjGravObservationsCfg, ProjGravAnchorObsObservationsCfg, ProjGravAnchorEEObsObservationsCfg
 
 
 @configclass
@@ -145,6 +145,17 @@ class G1FlatProjGravAnchorObsMotionAEEnvCfg(G1FlatProjGravAnchorObsEnvCfg):
         self.commands.motion.future_steps = 10
         self.commands.motion.motion_ae_enabled = True
         self.commands.motion.motion_ae_latent_mode = "z_dequant"
+
+
+@configclass
+class G1FlatProjGravAnchorEEObsEnvCfg(G1FlatProjGravAnchorObsEnvCfg):
+    observations: ProjGravAnchorEEObsObservationsCfg = ProjGravAnchorEEObsObservationsCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.commands.motion.future_steps = 10
+        self.commands.motion.motion_ae_enabled = True
+        self.commands.motion.motion_ae_latent_mode = "z_c"
 
 
 @configclass
