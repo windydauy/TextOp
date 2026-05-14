@@ -1,5 +1,6 @@
 import glob
 import re
+import sys
 import time
 import mujoco, mujoco_viewer, mujoco.viewer
 # `$ pip install mujoco-python-viewer` If `mujoco_viewer` not found.
@@ -92,6 +93,8 @@ def load_onnxruntime():
 
 NUM_ACTIONS = 29
 COMMAND_DIM_PER_STEP = NUM_ACTIONS * 2
+MOTION_AE_LATENT_DIM = 32
+MOTION_TRANSFORMER_VAE_LATENT_DIM = 128
 ANCHOR_POS_DIM_PER_STEP = 3
 ANCHOR_ORI_DIM_PER_STEP = 6
 PROJECTED_GRAVITY_DIM = 3
@@ -106,9 +109,13 @@ LAST_ACTION_DIM = NUM_ACTIONS
 TASK_AUTO = "auto"
 TASK_PROJ_GRAV_OBS = "Tracking-Flat-G1-ProjGravObs-MNMLP-v0"
 TASK_PROJ_GRAV_ANCHOR_OBS = "Tracking-Flat-G1-ProjGravAnchorObs-NMMLP-v0"
+TASK_PROJ_GRAV_ANCHOR_OBS_MOTION_AE = "Tracking-Flat-G1-ProjGravAnchorObs-MotionAE-NMMLP-v0"
+TASK_PROJ_GRAV_ANCHOR_OBS_TRANSFORMER_VAE = "Tracking-Flat-G1-ProjGravAnchorObs-TransformerVAE-NMMLP-v0"
 SUPPORTED_TASKS = (
     TASK_PROJ_GRAV_OBS,
     TASK_PROJ_GRAV_ANCHOR_OBS,
+    TASK_PROJ_GRAV_ANCHOR_OBS_MOTION_AE,
+    TASK_PROJ_GRAV_ANCHOR_OBS_TRANSFORMER_VAE,
 )
 
 PROJ_GRAV_OBS_TERMS = (
@@ -138,9 +145,10 @@ PROJ_GRAV_ANCHOR_OBS_TERMS = (
 TASK_OBSERVATION_TERMS = {
     TASK_PROJ_GRAV_OBS: PROJ_GRAV_OBS_TERMS,
     TASK_PROJ_GRAV_ANCHOR_OBS: PROJ_GRAV_ANCHOR_OBS_TERMS,
+    TASK_PROJ_GRAV_ANCHOR_OBS_MOTION_AE: PROJ_GRAV_ANCHOR_OBS_TERMS,
+    TASK_PROJ_GRAV_ANCHOR_OBS_TRANSFORMER_VAE: PROJ_GRAV_ANCHOR_OBS_TERMS,
 }
 FUTURE_TERM_DIMS = {
-    "command": COMMAND_DIM_PER_STEP,
     "motion_anchor_pos_b": ANCHOR_POS_DIM_PER_STEP,
     "motion_anchor_ori_b": ANCHOR_ORI_DIM_PER_STEP,
 }
@@ -154,6 +162,26 @@ FIXED_TERM_DIMS = {
     "joint_vel": JOINT_VEL_DIM,
     "actions": LAST_ACTION_DIM,
 }
+
+DEFAULT_MOTION_AE_PROJECT_ROOT = "/home/humanoid/yzh/TextOp/motion_ae"
+DEFAULT_MOTION_AE_RUN_DIR = (
+    "/home/humanoid/yzh/TextOp/motion_ae/outputs/motion_ae/"
+    "2026-05-08_17-48-33_opti_clean_our_20"
+)
+DEFAULT_MOTION_AE_CONFIG_PATH = f"{DEFAULT_MOTION_AE_RUN_DIR}/params/config.yaml"
+DEFAULT_MOTION_AE_STATS_PATH = f"{DEFAULT_MOTION_AE_RUN_DIR}/artifacts/stats.npz"
+DEFAULT_MOTION_AE_ENCODER_ONNX_PATH = f"{DEFAULT_MOTION_AE_RUN_DIR}/artifacts/motion_ae_encoder_zdequant.onnx"
+
+DEFAULT_MOTION_TRANSFORMER_VAE_PROJECT_ROOT = "/home/humanoid/yzh/TextOp/motion_ae/transformer_vae"
+DEFAULT_MOTION_TRANSFORMER_VAE_RUN_DIR = (
+    "/home/humanoid/yzh/TextOp/motion_ae/outputs/transformer_vae/"
+    "2026-05-11_00-19-00_optitrack_npz_trip_filtered"
+)
+DEFAULT_MOTION_TRANSFORMER_VAE_CONFIG_PATH = f"{DEFAULT_MOTION_TRANSFORMER_VAE_RUN_DIR}/params/config.yaml"
+DEFAULT_MOTION_TRANSFORMER_VAE_STATS_PATH = f"{DEFAULT_MOTION_TRANSFORMER_VAE_RUN_DIR}/artifacts/stats.npz"
+DEFAULT_MOTION_TRANSFORMER_VAE_ENCODER_ONNX_PATH = (
+    f"{DEFAULT_MOTION_TRANSFORMER_VAE_RUN_DIR}/artifacts/motion_transformer_vae_encoder_z_c.onnx"
+)
 
 
 # 定义枚举类型
@@ -462,18 +490,42 @@ def _uses_robot_anchor_obs(obs_config):
     return "AnchorObs" in obs_config
 
 
-def infer_task_from_observation_names(observation_names):
+def _candidate_tasks_from_observation_names(observation_names):
     names = tuple(observation_names or ())
     if not names:
-        return None
-    for task, terms in TASK_OBSERVATION_TERMS.items():
-        if names == terms:
-            return task
+        return []
+    candidates = [task for task, terms in TASK_OBSERVATION_TERMS.items() if names == terms]
+    if candidates:
+        return candidates
     if "robot_anchor_pos_w" in names or "robot_anchor_ori_w" in names:
-        return TASK_PROJ_GRAV_ANCHOR_OBS
+        return [
+            TASK_PROJ_GRAV_ANCHOR_OBS,
+            TASK_PROJ_GRAV_ANCHOR_OBS_MOTION_AE,
+            TASK_PROJ_GRAV_ANCHOR_OBS_TRANSFORMER_VAE,
+        ]
     if "projected_gravity" in names:
-        return TASK_PROJ_GRAV_OBS
-    return None
+        return [TASK_PROJ_GRAV_OBS]
+    return []
+
+
+def infer_task_from_observation_names(observation_names, input_dim=None, future_steps=None):
+    candidates = _candidate_tasks_from_observation_names(observation_names)
+    if not candidates:
+        return None
+    if input_dim is not None:
+        matches = []
+        for candidate in candidates:
+            try:
+                if future_steps is None:
+                    infer_future_steps_from_input_dim(input_dim, task=candidate)
+                    matches.append(candidate)
+                elif compute_observation_dim(future_steps, task=candidate) == input_dim:
+                    matches.append(candidate)
+            except ValueError:
+                continue
+        if len(matches) == 1:
+            return matches[0]
+    return candidates[0]
 
 
 def task_from_obs_config(obs_config):
@@ -486,7 +538,7 @@ def task_from_obs_config(obs_config):
     raise ValueError(f"Unsupported obs_config={obs_config}. Please pass --task explicitly.")
 
 
-def resolve_task(task=TASK_AUTO, policy_metadata=None, obs_config="ProjGravObs"):
+def resolve_task(task=TASK_AUTO, policy_metadata=None, obs_config="ProjGravObs", policy_input_dim=None, future_steps=None):
     if task != TASK_AUTO:
         if task not in TASK_OBSERVATION_TERMS:
             choices = ", ".join(SUPPORTED_TASKS)
@@ -496,7 +548,11 @@ def resolve_task(task=TASK_AUTO, policy_metadata=None, obs_config="ProjGravObs")
     metadata_obs_names = []
     if policy_metadata:
         metadata_obs_names = _csv_metadata_list(policy_metadata.get("observation_names"))
-    inferred_task = infer_task_from_observation_names(metadata_obs_names)
+    inferred_task = infer_task_from_observation_names(
+        metadata_obs_names,
+        input_dim=policy_input_dim,
+        future_steps=future_steps,
+    )
     if inferred_task is not None:
         return inferred_task
     return task_from_obs_config(obs_config)
@@ -513,11 +569,18 @@ def get_observation_terms(task=None, obs_config="ProjGravObs", observation_terms
         raise ValueError(f"Unsupported task={resolved_task}. Supported tasks: {choices}") from exc
 
 
-def _term_dims(observation_terms):
+def _term_dims(observation_terms, task=None):
     fixed_dim = 0
     per_step_dim = 0
     for term in observation_terms:
-        if term in FUTURE_TERM_DIMS:
+        if term == "command":
+            if task == TASK_PROJ_GRAV_ANCHOR_OBS_MOTION_AE:
+                fixed_dim += MOTION_AE_LATENT_DIM
+            elif task == TASK_PROJ_GRAV_ANCHOR_OBS_TRANSFORMER_VAE:
+                fixed_dim += MOTION_TRANSFORMER_VAE_LATENT_DIM
+            else:
+                per_step_dim += COMMAND_DIM_PER_STEP
+        elif term in FUTURE_TERM_DIMS:
             per_step_dim += FUTURE_TERM_DIMS[term]
         elif term in FIXED_TERM_DIMS:
             fixed_dim += FIXED_TERM_DIMS[term]
@@ -528,7 +591,7 @@ def _term_dims(observation_terms):
 
 def compute_observation_dim(future_steps, obs_config="ProjGravObs", task=None, observation_terms=None):
     terms = get_observation_terms(task=task, obs_config=obs_config, observation_terms=observation_terms)
-    fixed_dim, per_step_dim = _term_dims(terms)
+    fixed_dim, per_step_dim = _term_dims(terms, task=task)
     return future_steps * per_step_dim + fixed_dim
 
 
@@ -536,7 +599,7 @@ def infer_future_steps_from_input_dim(input_dim, obs_config="ProjGravObs", task=
     if input_dim is None:
         return None
     terms = get_observation_terms(task=task, obs_config=obs_config, observation_terms=observation_terms)
-    fixed_dim, per_step_dim = _term_dims(terms)
+    fixed_dim, per_step_dim = _term_dims(terms, task=task)
     remainder = input_dim - fixed_dim
     if remainder <= 0 or remainder % per_step_dim != 0:
         raise ValueError(
@@ -600,9 +663,206 @@ def update_joint_visualization(viewer, motion_loader, t):
     )
 
 
+class MotionAEOnnxLatentAdapter:
+    """Encode one motion.npz into MotionAE z_dequant latents using an encoder ONNX."""
+
+    def __init__(
+        self,
+        *,
+        project_root,
+        config_path,
+        stats_path,
+        encoder_onnx_path,
+        batch_size=4096,
+    ):
+        self.project_root = Path(project_root).expanduser().resolve()
+        self.config_path = Path(config_path).expanduser().resolve()
+        self.stats_path = Path(stats_path).expanduser().resolve()
+        self.encoder_onnx_path = Path(encoder_onnx_path).expanduser().resolve()
+        self.batch_size = int(batch_size)
+        if self.batch_size <= 0:
+            raise ValueError(f"motion_ae_batch_size must be positive, got {batch_size}")
+        self._validate_paths()
+        if str(self.project_root) not in sys.path:
+            sys.path.insert(0, str(self.project_root))
+
+        from motion_ae.config import load_config
+        from motion_ae.utils.normalization import FeatureNormalizer
+
+        self.cfg = load_config(str(self.config_path))
+        self.normalizer = FeatureNormalizer.load(str(self.stats_path), eps=self.cfg.normalization.eps)
+        self.window_size = int(self.cfg.window_size)
+        self.feature_dim = int(self.normalizer.mean.shape[0])
+        self.latent_dim = int(self.cfg.model.latent_dim)
+
+        ort = load_onnxruntime()
+        available_providers = ort.get_available_providers()
+        providers = ["CPUExecutionProvider"]
+        if "CUDAExecutionProvider" in available_providers:
+            providers.insert(0, "CUDAExecutionProvider")
+        self.session = ort.InferenceSession(str(self.encoder_onnx_path), providers=providers)
+        self.input_name = self.session.get_inputs()[0].name
+        self.output_names = [output.name for output in self.session.get_outputs()]
+        self.z_dequant_output_name = "z_dequant" if "z_dequant" in self.output_names else self.output_names[0]
+
+    def _validate_paths(self):
+        for label, path in {
+            "MotionAE project root": self.project_root,
+            "MotionAE config": self.config_path,
+            "MotionAE stats": self.stats_path,
+            "MotionAE encoder ONNX": self.encoder_onnx_path,
+        }.items():
+            if not path.exists():
+                raise FileNotFoundError(f"{label} not found: {path}")
+
+    def encode_npz_data(self, npz_data):
+        from motion_ae.feature_builder import build_features
+
+        features, slices = build_features(
+            npz_data,
+            self.cfg.npz_keys,
+            self.cfg.pelvis,
+            debug=False,
+        )
+        if slices.total_dim != self.feature_dim:
+            raise ValueError(
+                f"MotionAE feature dim mismatch: encoder expects {self.feature_dim}, "
+                f"motion produced {slices.total_dim}"
+            )
+        if features.shape[0] == 0:
+            raise ValueError("Cannot encode empty motion")
+
+        normalized = self.normalizer.normalize_np(features).astype(np.float32, copy=False)
+        windows = self._future_windows(normalized)
+        chunks = []
+        for start in range(0, windows.shape[0], self.batch_size):
+            batch = windows[start:start + self.batch_size]
+            latent = self.session.run([self.z_dequant_output_name], {self.input_name: batch})[0]
+            chunks.append(np.asarray(latent, dtype=np.float32))
+        latents = np.concatenate(chunks, axis=0)
+        if latents.ndim != 2 or latents.shape[1] != self.latent_dim:
+            raise ValueError(f"MotionAE latent shape mismatch: expected [T, {self.latent_dim}], got {latents.shape}")
+        if not np.isfinite(latents).all():
+            raise ValueError("MotionAE latents contain non-finite values")
+        return latents
+
+    def _future_windows(self, features):
+        frame_count = int(features.shape[0])
+        frame_ids = np.arange(frame_count, dtype=np.int64)[:, None]
+        offsets = np.arange(self.window_size, dtype=np.int64)[None, :]
+        indices = np.clip(frame_ids + offsets, 0, frame_count - 1)
+        return features[indices].astype(np.float32, copy=False)
+
+
+class MotionTransformerVAEOnnxLatentAdapter:
+    """Encode one motion.npz into Transformer VAE z_c latents using an encoder ONNX."""
+
+    def __init__(
+        self,
+        *,
+        project_root,
+        config_path,
+        stats_path,
+        encoder_onnx_path,
+        batch_size=4096,
+    ):
+        self.project_root = Path(project_root).expanduser().resolve()
+        self.config_path = Path(config_path).expanduser().resolve()
+        self.stats_path = Path(stats_path).expanduser().resolve()
+        self.encoder_onnx_path = Path(encoder_onnx_path).expanduser().resolve()
+        self.batch_size = int(batch_size)
+        if self.batch_size <= 0:
+            raise ValueError(f"motion_transformer_vae_batch_size must be positive, got {batch_size}")
+        self._validate_paths()
+        for import_root in (self.project_root.parent, self.project_root):
+            import_root_str = str(import_root)
+            if import_root_str not in sys.path:
+                sys.path.insert(0, import_root_str)
+
+        from motion_ae.utils.normalization import FeatureNormalizer
+        from transformer_vae.config import load_config
+
+        self.cfg = load_config(str(self.config_path))
+        self.normalizer = FeatureNormalizer.load(str(self.stats_path), eps=self.cfg.normalization.eps)
+        self.window_size = int(self.cfg.window_size)
+        self.feature_dim = int(self.normalizer.mean.shape[0])
+        self.latent_size = int(self.cfg.model.latent_dim[0])
+        self.latent_dim = int(self.cfg.model.latent_dim[-1])
+        self.flat_latent_dim = self.latent_size * self.latent_dim
+
+        ort = load_onnxruntime()
+        available_providers = ort.get_available_providers()
+        providers = ["CPUExecutionProvider"]
+        if "CUDAExecutionProvider" in available_providers:
+            providers.insert(0, "CUDAExecutionProvider")
+        self.session = ort.InferenceSession(str(self.encoder_onnx_path), providers=providers)
+        self.input_name = self.session.get_inputs()[0].name
+        self.output_names = [output.name for output in self.session.get_outputs()]
+        self.z_c_output_name = "z_c" if "z_c" in self.output_names else self.output_names[0]
+
+    def _validate_paths(self):
+        for label, path in {
+            "MotionTransformerVAE project root": self.project_root,
+            "MotionTransformerVAE config": self.config_path,
+            "MotionTransformerVAE stats": self.stats_path,
+            "MotionTransformerVAE encoder ONNX": self.encoder_onnx_path,
+        }.items():
+            if not path.exists():
+                raise FileNotFoundError(f"{label} not found: {path}")
+
+    def encode_npz_data(self, npz_data):
+        from motion_ae.feature_builder import build_features
+
+        features, slices = build_features(
+            npz_data,
+            self.cfg.npz_keys,
+            self.cfg.pelvis,
+            debug=False,
+        )
+        if slices.total_dim != self.feature_dim:
+            raise ValueError(
+                f"MotionTransformerVAE feature dim mismatch: encoder expects {self.feature_dim}, "
+                f"motion produced {slices.total_dim}"
+            )
+        if features.shape[0] == 0:
+            raise ValueError("Cannot encode empty motion")
+
+        normalized = self.normalizer.normalize_np(features).astype(np.float32, copy=False)
+        windows = self._future_windows(normalized)
+        chunks = []
+        for start in range(0, windows.shape[0], self.batch_size):
+            batch = windows[start:start + self.batch_size]
+            latent = self.session.run([self.z_c_output_name], {self.input_name: batch})[0]
+            chunks.append(np.asarray(latent, dtype=np.float32))
+        latents = np.concatenate(chunks, axis=0)
+        if latents.ndim != 2 or latents.shape[1] != self.flat_latent_dim:
+            raise ValueError(
+                "MotionTransformerVAE latent shape mismatch: "
+                f"expected [T, {self.flat_latent_dim}], got {latents.shape}"
+            )
+        if not np.isfinite(latents).all():
+            raise ValueError("MotionTransformerVAE latents contain non-finite values")
+        return latents
+
+    def _future_windows(self, features):
+        frame_count = int(features.shape[0])
+        frame_ids = np.arange(frame_count, dtype=np.int64)[:, None]
+        offsets = np.arange(self.window_size, dtype=np.int64)[None, :]
+        indices = np.clip(frame_ids + offsets, 0, frame_count - 1)
+        return features[indices].astype(np.float32, copy=False)
+
+
 # ====== MotionLoader 类（参考 isaaclab） ======
 class MotionLoader:
-    def __init__(self, motion_file, future_steps, anchor_body_name, body_names=None):
+    def __init__(
+        self,
+        motion_file,
+        future_steps,
+        anchor_body_name,
+        body_names=None,
+        motion_ae_adapter=None,
+        motion_transformer_vae_adapter=None,
+    ):
         motion_file = resolve_motion_file(motion_file)
         print(motion_file)
         data = np.load(motion_file)
@@ -628,6 +888,32 @@ class MotionLoader:
 
         # Future steps configuration
         self.future_steps = future_steps
+        self.motion_ae_latents = None
+        if motion_ae_adapter is not None and motion_transformer_vae_adapter is not None:
+            raise ValueError("Only one latent adapter can be enabled for deploy.")
+        if motion_ae_adapter is not None:
+            if motion_ae_adapter.window_size != self.future_steps:
+                raise ValueError(
+                    "MotionAE encoder window_size must match deploy future_steps: "
+                    f"{motion_ae_adapter.window_size} vs {self.future_steps}"
+                )
+            self.motion_ae_latents = motion_ae_adapter.encode_npz_data(data)
+            if self.motion_ae_latents.shape[0] != self.T:
+                raise ValueError(
+                    f"MotionAE latent length mismatch: {self.motion_ae_latents.shape[0]} vs motion frames {self.T}"
+                )
+        if motion_transformer_vae_adapter is not None:
+            if motion_transformer_vae_adapter.window_size != self.future_steps:
+                raise ValueError(
+                    "MotionTransformerVAE encoder window_size must match deploy future_steps: "
+                    f"{motion_transformer_vae_adapter.window_size} vs {self.future_steps}"
+                )
+            self.motion_ae_latents = motion_transformer_vae_adapter.encode_npz_data(data)
+            if self.motion_ae_latents.shape[0] != self.T:
+                raise ValueError(
+                    "MotionTransformerVAE latent length mismatch: "
+                    f"{self.motion_ae_latents.shape[0]} vs motion frames {self.T}"
+                )
 
 
 def quat_rotate_inverse_np(q: np.ndarray, v: np.ndarray) -> np.ndarray:
@@ -666,6 +952,12 @@ def quat_rotate_inverse_np(q: np.ndarray, v: np.ndarray) -> np.ndarray:
 # ====== observation 计算函数 ======
 def get_command(motion_loader, t):
     """Get command (joint_pos + joint_vel) for future steps - matching Isaac Lab order"""
+    if motion_loader.motion_ae_latents is not None:
+        if t < 0:
+            return np.zeros(motion_loader.motion_ae_latents.shape[1], dtype=np.float32)
+        step_idx = min(t, motion_loader.T - 1)
+        return motion_loader.motion_ae_latents[step_idx].astype(np.float32, copy=False)
+
     if t < 0:
         return np.zeros(motion_loader.future_steps * COMMAND_DIM_PER_STEP, dtype=np.float32)
 
@@ -987,6 +1279,32 @@ if __name__ == "__main__":
         help="Training task that defines the deploy observation layout. Use auto to infer from ONNX metadata.",
     )
     parser.add_argument("--anchor_body_name", type=str, default=None, help="Anchor body name used by the motion command.")
+    parser.add_argument("--motion_ae_encoder_onnx_path", type=str, default=DEFAULT_MOTION_AE_ENCODER_ONNX_PATH)
+    parser.add_argument("--motion_ae_project_root", type=str, default=DEFAULT_MOTION_AE_PROJECT_ROOT)
+    parser.add_argument("--motion_ae_config_path", type=str, default=DEFAULT_MOTION_AE_CONFIG_PATH)
+    parser.add_argument("--motion_ae_stats_path", type=str, default=DEFAULT_MOTION_AE_STATS_PATH)
+    parser.add_argument("--motion_ae_batch_size", type=int, default=4096)
+    parser.add_argument(
+        "--motion_transformer_vae_encoder_onnx_path",
+        type=str,
+        default=DEFAULT_MOTION_TRANSFORMER_VAE_ENCODER_ONNX_PATH,
+    )
+    parser.add_argument(
+        "--motion_transformer_vae_project_root",
+        type=str,
+        default=DEFAULT_MOTION_TRANSFORMER_VAE_PROJECT_ROOT,
+    )
+    parser.add_argument(
+        "--motion_transformer_vae_config_path",
+        type=str,
+        default=DEFAULT_MOTION_TRANSFORMER_VAE_CONFIG_PATH,
+    )
+    parser.add_argument(
+        "--motion_transformer_vae_stats_path",
+        type=str,
+        default=DEFAULT_MOTION_TRANSFORMER_VAE_STATS_PATH,
+    )
+    parser.add_argument("--motion_transformer_vae_batch_size", type=int, default=4096)
 
     args = parser.parse_args()
     print(args)
@@ -1024,7 +1342,13 @@ if __name__ == "__main__":
     obs_name = session.get_inputs()[0].name
     policy_metadata = get_policy_metadata(session)
     policy_input_dim = get_policy_input_dim(session)
-    task = resolve_task(args.task, policy_metadata=policy_metadata, obs_config=args.obs_config)
+    task = resolve_task(
+        args.task,
+        policy_metadata=policy_metadata,
+        obs_config=args.obs_config,
+        policy_input_dim=policy_input_dim,
+        future_steps=args.future_steps,
+    )
     observation_terms = get_observation_terms(task=task)
 
     anchor_body_name = args.anchor_body_name or policy_metadata.get("anchor_body_name", "pelvis")
@@ -1052,11 +1376,32 @@ if __name__ == "__main__":
             f"Check --task and --future_steps."
         )
 
+    motion_ae_adapter = None
+    motion_transformer_vae_adapter = None
+    if task == TASK_PROJ_GRAV_ANCHOR_OBS_MOTION_AE:
+        motion_ae_adapter = MotionAEOnnxLatentAdapter(
+            project_root=args.motion_ae_project_root,
+            config_path=args.motion_ae_config_path,
+            stats_path=args.motion_ae_stats_path,
+            encoder_onnx_path=args.motion_ae_encoder_onnx_path,
+            batch_size=args.motion_ae_batch_size,
+        )
+    elif task == TASK_PROJ_GRAV_ANCHOR_OBS_TRANSFORMER_VAE:
+        motion_transformer_vae_adapter = MotionTransformerVAEOnnxLatentAdapter(
+            project_root=args.motion_transformer_vae_project_root,
+            config_path=args.motion_transformer_vae_config_path,
+            stats_path=args.motion_transformer_vae_stats_path,
+            encoder_onnx_path=args.motion_transformer_vae_encoder_onnx_path,
+            batch_size=args.motion_transformer_vae_batch_size,
+        )
+
     motion_loader = MotionLoader(
         motion_path,
         future_steps=future_steps,
         anchor_body_name=anchor_body_name,
         body_names=body_names,
+        motion_ae_adapter=motion_ae_adapter,
+        motion_transformer_vae_adapter=motion_transformer_vae_adapter,
     )
     T = motion_loader.T
     print("obs dim: ", session.get_inputs()[0])

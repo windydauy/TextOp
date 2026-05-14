@@ -84,6 +84,42 @@ torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
 
 
+def resolve_motion_files(motion_file_arg: str) -> list[str]:
+    """Resolve a motion.npz path, glob, or directory tree into sorted files."""
+    path = Path(motion_file_arg).expanduser()
+    patterns: list[str] = []
+
+    if path.is_file():
+        if path.name != "motion.npz":
+            raise FileNotFoundError(f"Motion file must be named motion.npz, got {path}")
+        return [str(path)]
+
+    if path.is_dir():
+        patterns.append(str(path / "**" / "motion.npz"))
+    else:
+        raw_arg = str(path)
+        if any(ch in raw_arg for ch in "*?[]"):
+            patterns.append(raw_arg)
+            patterns.append(str(path / "motion.npz"))
+            patterns.append(str(path / "**" / "motion.npz"))
+        else:
+            patterns.append(str(path / "motion.npz"))
+
+    motion_files: list[str] = []
+    seen: set[str] = set()
+    for pattern in patterns:
+        for match in glob.glob(pattern, recursive=True):
+            match_path = Path(match)
+            if match_path.is_dir():
+                match_path = match_path / "motion.npz"
+            if match_path.is_file() and match_path.name == "motion.npz":
+                resolved = str(match_path)
+                if resolved not in seen:
+                    seen.add(resolved)
+                    motion_files.append(resolved)
+    return sorted(motion_files)
+
+
 
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
@@ -98,10 +134,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.seed = agent_cfg.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
 
-    motion_files = glob.glob(str(Path(args_cli.motion_file) / "motion.npz"))
+    motion_files = resolve_motion_files(args_cli.motion_file)
     if not motion_files:
         raise FileNotFoundError(f"No motion.npz found in {Path(args_cli.motion_file)}")
     env_cfg.commands.motion.motion_files = motion_files  # List[str]
+    print(f"[INFO]: Resolved {len(motion_files)} motion files from {args_cli.motion_file}")
 
     # specify directory for logging experiments
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)

@@ -148,6 +148,16 @@ class G1FlatProjGravAnchorObsMotionAEEnvCfg(G1FlatProjGravAnchorObsEnvCfg):
 
 
 @configclass
+class G1FlatProjGravAnchorObsTransformerVAEEnvCfg(G1FlatProjGravAnchorObsEnvCfg):
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.commands.motion.future_steps = 10
+        self.commands.motion.motion_transformer_vae_enabled = True
+        self.commands.motion.motion_transformer_vae_latent_mode = "z_c"
+
+
+@configclass
 class G1FlatLowFreqEnvCfg(G1FlatEnvCfg):
 
     def __post_init__(self):

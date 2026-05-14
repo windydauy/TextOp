@@ -26,6 +26,7 @@ from isaaclab.utils.math import (
 )
 from .motion_body_index import resolve_motion_body_indexes
 from .motion_ae_latent import MotionAELatentAdapter
+from .motion_transformer_vae_latent import MotionTransformerVAELatentAdapter
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -86,7 +87,8 @@ class MultiMotionLoader:
                  body_indexes: Sequence[int],
                  body_names: Sequence[str] | None = None,
                  device: str = "cpu",
-                 motion_ae_adapter: MotionAELatentAdapter | None = None):
+                 motion_ae_adapter: MotionAELatentAdapter | None = None,
+                 motion_transformer_vae_adapter: MotionTransformerVAELatentAdapter | None = None):
         assert len(motion_files) > 0, "motion_files 不能为空"
         self.num_files = len(motion_files)
         self._fallback_body_indexes = [int(index) for index in body_indexes]
@@ -102,6 +104,7 @@ class MultiMotionLoader:
         self._body_lin_vel_w_list = []
         self._body_ang_vel_w_list = []
         self.motion_ae_latents_list = []
+        self.motion_transformer_vae_latents_list = []
         self.fps_list = []
         self.file_lengths = []
 
@@ -155,6 +158,15 @@ class MultiMotionLoader:
                     )
                 self.motion_ae_latents_list.append(latent)
 
+            if motion_transformer_vae_adapter is not None:
+                latent = motion_transformer_vae_adapter.encode_npz_data(data).to(device)
+                if latent.shape[0] != jp.shape[0]:
+                    raise ValueError(
+                        f"MotionTransformerVAE latent length mismatch for {motion_file}: "
+                        f"{latent.shape[0]} vs {jp.shape[0]}"
+                    )
+                self.motion_transformer_vae_latents_list.append(latent)
+
             self.file_lengths.append(jp.shape[0])
 
         self.file_lengths = torch.tensor(self.file_lengths,
@@ -194,6 +206,9 @@ class MultiMotionLoader:
         if self.motion_ae_latents_list:
             data["motion_ae_latent"] = self.motion_ae_latents_list[motion_idx][
                 time_steps_tensor]
+        if self.motion_transformer_vae_latents_list:
+            data["motion_transformer_vae_latent"] = self.motion_transformer_vae_latents_list[
+                motion_idx][time_steps_tensor]
         return data
 
 
@@ -212,6 +227,9 @@ class MotionCommand(CommandTerm):
             self.cfg.body_names, preserve_order=True)[0],
                                          dtype=torch.long,
                                          device=self.device)
+
+        if self.cfg.motion_ae_enabled and self.cfg.motion_transformer_vae_enabled:
+            raise ValueError("Only one latent command adapter can be enabled at a time")
 
         motion_ae_adapter = None
         if self.cfg.motion_ae_enabled:
@@ -232,12 +250,32 @@ class MotionCommand(CommandTerm):
                 )
         self.motion_ae_adapter = motion_ae_adapter
 
+        motion_transformer_vae_adapter = None
+        if self.cfg.motion_transformer_vae_enabled:
+            motion_transformer_vae_adapter = MotionTransformerVAELatentAdapter(
+                project_root=self.cfg.motion_transformer_vae_project_root,
+                config_path=self.cfg.motion_transformer_vae_config_path,
+                checkpoint_path=self.cfg.motion_transformer_vae_checkpoint_path,
+                stats_path=self.cfg.motion_transformer_vae_stats_path,
+                device=self.device,
+                latent_mode=self.cfg.motion_transformer_vae_latent_mode,
+                batch_size=self.cfg.motion_transformer_vae_batch_size,
+            )
+            if self.cfg.future_steps != motion_transformer_vae_adapter.window_size:
+                raise ValueError(
+                    "MotionTransformerVAE latent tracker requires future_steps to match "
+                    f"Transformer VAE window_size: {self.cfg.future_steps} vs "
+                    f"{motion_transformer_vae_adapter.window_size}"
+                )
+        self.motion_transformer_vae_adapter = motion_transformer_vae_adapter
+
         self.motion = MultiMotionLoader(
             self.cfg.motion_files,
             self.body_indexes.tolist(),
             body_names=self.cfg.body_names,
             device=self.device,
             motion_ae_adapter=motion_ae_adapter,
+            motion_transformer_vae_adapter=motion_transformer_vae_adapter,
         )
 
         self.buffer_length: int = np.min(
@@ -362,6 +400,14 @@ class MotionCommand(CommandTerm):
                                                        self.buffer_length,
                                                        latent_dim,
                                                        device=self.device)
+        if self.cfg.motion_transformer_vae_enabled:
+            latent_dim = self.motion.motion_transformer_vae_latents_list[0].shape[1]
+            self.motion_transformer_vae_latent_buffer = torch.zeros(
+                self.num_envs,
+                self.buffer_length,
+                latent_dim,
+                device=self.device,
+            )
 
         # 初始化quaternion为[1,0,0,0]
         self.body_quat_w_buffer[:, :, :, 0] = 1.0
@@ -391,6 +437,9 @@ class MotionCommand(CommandTerm):
             if self.cfg.motion_ae_enabled:
                 self.motion_ae_latent_buffer[env_id] = motion_data[
                     "motion_ae_latent"]
+            if self.cfg.motion_transformer_vae_enabled:
+                self.motion_transformer_vae_latent_buffer[env_id] = motion_data[
+                    "motion_transformer_vae_latent"]
 
         if self.cfg.random_static_prob > 0:
             # Usage: p = random_static_prob
@@ -425,10 +474,19 @@ class MotionCommand(CommandTerm):
 
     @property
     def command(self) -> torch.Tensor:
+        if self.cfg.motion_transformer_vae_enabled:
+            return self.motion_transformer_vae_latent
         if self.cfg.motion_ae_enabled:
             return self.motion_ae_latent
         cmd = torch.cat([self.motion_joint_pos, self.motion_joint_vel], dim=1)
         return cmd
+
+    @property
+    def motion_transformer_vae_latent(self) -> torch.Tensor:
+        buffer_indices = torch.clamp(self.time_steps - self.buffer_start_time,
+                                     0, self.buffer_length - 1)
+        return self.motion_transformer_vae_latent_buffer[
+            torch.arange(self.num_envs, device=self.device), buffer_indices]
 
     @property
     def motion_ae_latent(self) -> torch.Tensor:
@@ -1121,6 +1179,25 @@ class MotionCommandCfg(CommandTermCfg):
     )
     motion_ae_latent_mode: str = "z_dequant"
     motion_ae_batch_size: int = 4096
+
+    # Motion Transformer VAE latent command configuration.
+    motion_transformer_vae_enabled: bool = False
+    motion_transformer_vae_project_root: str = "/home/humanoid/yzh/TextOp/motion_ae/transformer_vae"
+    motion_transformer_vae_config_path: str = (
+        "/home/humanoid/yzh/TextOp/motion_ae/outputs/transformer_vae/"
+        "2026-05-11_00-19-00_optitrack_npz_trip_filtered/params/config.yaml"
+    )
+    motion_transformer_vae_checkpoint_path: str = (
+        "/home/humanoid/yzh/TextOp/motion_ae/outputs/transformer_vae/"
+        "2026-05-11_00-19-00_optitrack_npz_trip_filtered/checkpoints/"
+        "best_model.pt"
+    )
+    motion_transformer_vae_stats_path: str = (
+        "/home/humanoid/yzh/TextOp/motion_ae/outputs/transformer_vae/"
+        "2026-05-11_00-19-00_optitrack_npz_trip_filtered/artifacts/stats.npz"
+    )
+    motion_transformer_vae_latent_mode: str = "z_c"
+    motion_transformer_vae_batch_size: int = 4096
 
     # Start from zero configuration
     start_from_zero_step: bool = False
