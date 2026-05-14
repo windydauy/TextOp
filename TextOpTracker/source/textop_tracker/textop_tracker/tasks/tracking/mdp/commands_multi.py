@@ -93,7 +93,6 @@ class MultiMotionLoader:
         self.num_files = len(motion_files)
         self._fallback_body_indexes = [int(index) for index in body_indexes]
         self._requested_body_names = list(body_names) if body_names is not None else []
-        self._body_indexes_list = []
         self.device = device
 
         # 存储每个motion的数据为list，不进行填充
@@ -115,24 +114,6 @@ class MultiMotionLoader:
 
             self.fps_list.append(data["fps"])
 
-            jp = torch.tensor(data["joint_pos"],
-                              dtype=torch.float32,
-                              device=device)
-            jv = torch.tensor(data["joint_vel"],
-                              dtype=torch.float32,
-                              device=device)
-            bp = torch.tensor(data["body_pos_w"],
-                              dtype=torch.float32,
-                              device=device)
-            bq = torch.tensor(data["body_quat_w"],
-                              dtype=torch.float32,
-                              device=device)
-            blv = torch.tensor(data["body_lin_vel_w"],
-                               dtype=torch.float32,
-                               device=device)
-            bav = torch.tensor(data["body_ang_vel_w"],
-                               dtype=torch.float32,
-                               device=device)
             motion_body_names = data["body_names"] if "body_names" in data.files else None
             motion_body_indexes = resolve_motion_body_indexes(
                 motion_body_names=motion_body_names,
@@ -141,13 +122,31 @@ class MultiMotionLoader:
                 motion_file=motion_file,
             )
 
+            jp = torch.tensor(data["joint_pos"],
+                              dtype=torch.float32,
+                              device=device)
+            jv = torch.tensor(data["joint_vel"],
+                              dtype=torch.float32,
+                              device=device)
+            bp = torch.tensor(data["body_pos_w"][:, motion_body_indexes],
+                              dtype=torch.float32,
+                              device=device)
+            bq = torch.tensor(data["body_quat_w"][:, motion_body_indexes],
+                              dtype=torch.float32,
+                              device=device)
+            blv = torch.tensor(data["body_lin_vel_w"][:, motion_body_indexes],
+                               dtype=torch.float32,
+                               device=device)
+            bav = torch.tensor(data["body_ang_vel_w"][:, motion_body_indexes],
+                               dtype=torch.float32,
+                               device=device)
+
             self.joint_pos_list.append(jp)
             self.joint_vel_list.append(jv)
             self._body_pos_w_list.append(bp)
             self._body_quat_w_list.append(bq)
             self._body_lin_vel_w_list.append(blv)
             self._body_ang_vel_w_list.append(bav)
-            self._body_indexes_list.append(motion_body_indexes)
 
             if motion_ae_adapter is not None:
                 latent = motion_ae_adapter.encode_npz_data(data).to(device)
@@ -183,25 +182,19 @@ class MultiMotionLoader:
         time_steps_tensor = torch.clamp(time_steps_tensor,
                                         torch.tensor(0, device=self.device),
                                         self.file_lengths[motion_idx] - 1)
-        body_indexes = self._body_indexes_list[motion_idx]
-
         data = {
             "joint_pos":
             self.joint_pos_list[motion_idx][time_steps_tensor],
             "joint_vel":
             self.joint_vel_list[motion_idx][time_steps_tensor],
             "body_pos_w":
-            self._body_pos_w_list[motion_idx][time_steps_tensor]
-            [:, body_indexes],
+            self._body_pos_w_list[motion_idx][time_steps_tensor],
             "body_quat_w":
-            self._body_quat_w_list[motion_idx][time_steps_tensor]
-            [:, body_indexes],
+            self._body_quat_w_list[motion_idx][time_steps_tensor],
             "body_lin_vel_w":
-            self._body_lin_vel_w_list[motion_idx][time_steps_tensor]
-            [:, body_indexes],
+            self._body_lin_vel_w_list[motion_idx][time_steps_tensor],
             "body_ang_vel_w":
-            self._body_ang_vel_w_list[motion_idx][time_steps_tensor]
-            [:, body_indexes],
+            self._body_ang_vel_w_list[motion_idx][time_steps_tensor],
         }
         if self.motion_ae_latents_list:
             data["motion_ae_latent"] = self.motion_ae_latents_list[motion_idx][
