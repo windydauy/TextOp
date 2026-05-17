@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import math
 from pathlib import Path
 import time
 
@@ -22,6 +21,22 @@ EVAL_BODY_NAMES = [
     "left_ankle_roll_link",
     "right_ankle_roll_link",
 ]
+
+SUCCESS_METRIC_KEYS = (
+    "global_mpjpe",
+    "local_mpjpe",
+    "anchor_global_pos_error",
+    "anchor_local_pos_error",
+)
+
+FAIL_REASON_KEYS = (
+    "nan_or_inf",
+    "pelvis_height",
+    "global_mpjpe",
+    "local_mpjpe",
+    "anchor_global_pos",
+    "ee_global_pos",
+)
 
 
 def resolve_motion_files(path_arg: str, limit: int | None = None) -> list[str]:
@@ -99,6 +114,34 @@ class MetricAccumulator:
         return result
 
 
+class TerminationTracker:
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.args = args
+        self.counts = {key: 0 for key in FAIL_REASON_KEYS}
+
+    def update(self, values: dict[str, float], data: mujoco.MjData) -> str | None:
+        consecutive_fail_frames = max(int(self.args.consecutive_fail_frames), 1)
+        reasons = {
+            "nan_or_inf": self._has_nonfinite(values, data),
+            "pelvis_height": values["pelvis_global_height"] < self.args.pelvis_height_min,
+            "global_mpjpe": values["global_mpjpe"] > self.args.global_mpjpe_fail,
+            "local_mpjpe": values["local_mpjpe"] > self.args.local_mpjpe_fail,
+            "anchor_global_pos": values["anchor_global_pos_error"] > self.args.anchor_global_pos_fail,
+            "ee_global_pos": values["max_ee_global_pos_error"] > self.args.ee_global_pos_fail,
+        }
+        for reason, failed in reasons.items():
+            self.counts[reason] = self.counts[reason] + 1 if failed else 0
+            if self.counts[reason] >= consecutive_fail_frames:
+                return reason
+        return None
+
+    @staticmethod
+    def _has_nonfinite(values: dict[str, float], data: mujoco.MjData) -> bool:
+        if not np.isfinite(data.qpos).all() or not np.isfinite(data.qvel).all():
+            return True
+        return not all(np.isfinite(value) for value in values.values())
+
+
 def make_latent_adapters(task: str, args: argparse.Namespace):
     motion_ae_adapter = None
     motion_transformer_vae_adapter = None
@@ -160,6 +203,13 @@ def compute_frame_metrics(sim_data, motion_loader: dm.MotionLoader, t: int, eval
     for i, name in enumerate(EVAL_BODY_NAMES):
         values[f"{name}_global_pos_error"] = float(eval_pos_errors[i])
         values[f"{name}_global_ori_error_rad"] = float(eval_ori_errors[i])
+    ee_pos_errors = [
+        values[f"{name}_global_pos_error"]
+        for name in EVAL_BODY_NAMES
+        if name != "pelvis"
+    ]
+    values["max_ee_global_pos_error"] = float(max(ee_pos_errors))
+    values["pelvis_global_height"] = float(eval_robot_pos[EVAL_BODY_NAMES.index("pelvis"), 2])
     return values
 
 
@@ -199,9 +249,13 @@ def evaluate_motion(
     mujoco.mj_step(model, data)
 
     metrics = MetricAccumulator()
+    termination = TerminationTracker(args)
     eval_indexes = [motion_loader.motion_body_index(name) for name in EVAL_BODY_NAMES]
     inner_counter = 0
     max_frames = motion_loader.T if args.max_frames <= 0 else min(args.max_frames, motion_loader.T)
+    terminated = False
+    failure_frame = None
+    failure_reason = "none"
     while inner_counter < max_frames:
         for _ in range(args.control_decimation):
             tau = dm.pd_control(target_dof_pos, data.qpos[7:], dm.kps, np.zeros_like(dm.kds), data.qvel[6:], dm.kds)
@@ -224,11 +278,27 @@ def evaluate_motion(
             )
         action = session.run(None, {obs_name: obs_tensor})[0].squeeze().astype(np.float32)
         target_dof_pos = action[dm.isaaclab_to_mujoco_reindex] * dm.action_scale + dm.default_angles
-        metrics.update(compute_frame_metrics(data, motion_loader, inner_counter, eval_indexes))
+        frame_metrics = compute_frame_metrics(data, motion_loader, inner_counter, eval_indexes)
+        metrics.update(frame_metrics)
+        failure = termination.update(frame_metrics, data)
+        if failure is not None:
+            terminated = True
+            failure_frame = inner_counter
+            failure_reason = failure
+            inner_counter += 1
+            break
         inner_counter += 1
 
     summary = metrics.summary()
     summary["motion_file"] = motion_file
+    summary["motion_length"] = motion_loader.T
+    summary["evaluated_frames"] = inner_counter
+    summary["terminated"] = terminated
+    summary["success"] = not terminated and inner_counter >= motion_loader.T
+    summary["progress"] = min(float(inner_counter) / float(max(motion_loader.T, 1)), 1.0)
+    summary["failure_frame"] = -1 if failure_frame is None else failure_frame
+    summary["failure_reason"] = failure_reason
+    summary["max_frames_limited"] = args.max_frames > 0 and args.max_frames < motion_loader.T
     return summary
 
 
@@ -236,6 +306,14 @@ def flatten_row(summary: dict) -> dict[str, float | int | str]:
     row: dict[str, float | int | str] = {
         "motion_file": summary["motion_file"],
         "frames": summary["frames"],
+        "motion_length": summary["motion_length"],
+        "evaluated_frames": summary["evaluated_frames"],
+        "terminated": int(summary["terminated"]),
+        "success": int(summary["success"]),
+        "progress": summary["progress"],
+        "failure_frame": summary["failure_frame"],
+        "failure_reason": summary["failure_reason"],
+        "max_frames_limited": int(summary["max_frames_limited"]),
         "global_mpjpe": summary["global_mpjpe"],
         "local_mpjpe": summary["local_mpjpe"],
         "anchor_global_pos_error": summary["anchor_global_pos_error"],
@@ -252,24 +330,53 @@ def aggregate(summaries: list[dict]) -> dict:
     if total_frames <= 0:
         raise RuntimeError("No evaluated frames")
 
-    def weighted_scalar(key: str) -> float:
-        return float(sum(float(item[key]) * int(item["frames"]) for item in summaries) / total_frames)
+    success_items = [item for item in summaries if bool(item["success"])]
+
+    def weighted_scalar(key: str, items: list[dict] | None = None) -> float:
+        selected = summaries if items is None else items
+        selected_frames = sum(int(item["frames"]) for item in selected)
+        if selected_frames <= 0:
+            return 0.0
+        return float(sum(float(item[key]) * int(item["frames"]) for item in selected) / selected_frames)
 
     result: dict = {
         "num_motions": len(summaries),
         "frames": total_frames,
-        "global_mpjpe": weighted_scalar("global_mpjpe"),
-        "local_mpjpe": weighted_scalar("local_mpjpe"),
-        "anchor_global_pos_error": weighted_scalar("anchor_global_pos_error"),
-        "anchor_local_pos_error": weighted_scalar("anchor_local_pos_error"),
-        "eval_body_global_pos_error": {},
-        "eval_body_global_ori_error_rad": {},
+        "success_count": len(success_items),
+        "terminated_count": sum(1 for item in summaries if bool(item["terminated"])),
+        "success_rate": float(np.mean([bool(item["success"]) for item in summaries])),
+        "progress_rate": float(np.mean([float(item["progress"]) for item in summaries])),
+        "failure_reasons": {
+            reason: sum(1 for item in summaries if item["failure_reason"] == reason)
+            for reason in ("none", *FAIL_REASON_KEYS)
+        },
+        "all": {
+            "global_mpjpe": weighted_scalar("global_mpjpe"),
+            "local_mpjpe": weighted_scalar("local_mpjpe"),
+            "anchor_global_pos_error": weighted_scalar("anchor_global_pos_error"),
+            "anchor_local_pos_error": weighted_scalar("anchor_local_pos_error"),
+            "eval_body_global_pos_error": {},
+            "eval_body_global_ori_error_rad": {},
+        },
+        "success": {
+            "global_mpjpe": weighted_scalar("global_mpjpe", success_items),
+            "local_mpjpe": weighted_scalar("local_mpjpe", success_items),
+            "anchor_global_pos_error": weighted_scalar("anchor_global_pos_error", success_items),
+            "anchor_local_pos_error": weighted_scalar("anchor_local_pos_error", success_items),
+            "eval_body_global_pos_error": {},
+            "eval_body_global_ori_error_rad": {},
+        },
     }
-    for group in ("eval_body_global_pos_error", "eval_body_global_ori_error_rad"):
-        for name in EVAL_BODY_NAMES:
-            result[group][name] = float(
-                sum(float(item[group][name]) * int(item["frames"]) for item in summaries) / total_frames
-            )
+    for subset_name, items in (("all", summaries), ("success", success_items)):
+        selected_frames = sum(int(item["frames"]) for item in items)
+        for group in ("eval_body_global_pos_error", "eval_body_global_ori_error_rad"):
+            for name in EVAL_BODY_NAMES:
+                if selected_frames <= 0:
+                    result[subset_name][group][name] = 0.0
+                else:
+                    result[subset_name][group][name] = float(
+                        sum(float(item[group][name]) * int(item["frames"]) for item in items) / selected_frames
+                    )
     return result
 
 
@@ -286,6 +393,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_frames", type=int, default=0, help="Evaluate only first N frames per motion; 0 means full motion")
     parser.add_argument("--sim_dt", type=float, default=0.002)
     parser.add_argument("--control_decimation", type=int, default=10)
+    parser.add_argument("--consecutive_fail_frames", type=int, default=10)
+    parser.add_argument("--pelvis_height_min", type=float, default=0.35)
+    parser.add_argument("--global_mpjpe_fail", type=float, default=0.35)
+    parser.add_argument("--local_mpjpe_fail", type=float, default=0.25)
+    parser.add_argument("--anchor_global_pos_fail", type=float, default=0.60)
+    parser.add_argument("--ee_global_pos_fail", type=float, default=0.40)
     parser.add_argument(
         "--xml_path",
         default="./source/textop_tracker/textop_tracker/assets/unitree_description/mjcf/g1_act.xml",
@@ -365,6 +478,14 @@ def main() -> None:
         "future_steps": future_steps,
         "anchor_body_name": anchor_body_name,
         "observation_terms": list(observation_terms),
+        "success_criteria": {
+            "consecutive_fail_frames": max(int(args.consecutive_fail_frames), 1),
+            "pelvis_height_min": args.pelvis_height_min,
+            "global_mpjpe_fail": args.global_mpjpe_fail,
+            "local_mpjpe_fail": args.local_mpjpe_fail,
+            "anchor_global_pos_fail": args.anchor_global_pos_fail,
+            "ee_global_pos_fail": args.ee_global_pos_fail,
+        },
         "elapsed_sec": time.time() - started,
         "aggregate": aggregate_summary,
         "motions": summaries,
