@@ -153,7 +153,10 @@ def make_latent_adapters(task: str, args: argparse.Namespace):
             encoder_onnx_path=args.motion_ae_encoder_onnx_path,
             batch_size=args.motion_ae_batch_size,
         )
-    elif task == dm.TASK_PROJ_GRAV_ANCHOR_OBS_TRANSFORMER_VAE:
+    elif task in (
+        dm.TASK_PROJ_GRAV_ANCHOR_OBS_TRANSFORMER_VAE,
+        dm.TASK_PROJ_GRAV_ANCHOR_EE_OBS_TRANSFORMER_VAE,
+    ):
         motion_transformer_vae_adapter = dm.MotionTransformerVAEOnnxLatentAdapter(
             project_root=args.motion_transformer_vae_project_root,
             config_path=args.motion_transformer_vae_config_path,

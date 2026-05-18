@@ -112,12 +112,14 @@ TASK_PROJ_GRAV_ANCHOR_OBS = "Tracking-Flat-G1-ProjGravAnchorObs-NMMLP-v0"
 TASK_PROJ_GRAV_ANCHOR_OBS_MOTION_AE = "Tracking-Flat-G1-ProjGravAnchorObs-MotionAE-NMMLP-v0"
 TASK_PROJ_GRAV_ANCHOR_EE_OBS = "Tracking-Flat-G1-ProjGravAnchorEEObs-NMMLP-v0"
 TASK_PROJ_GRAV_ANCHOR_OBS_TRANSFORMER_VAE = "Tracking-Flat-G1-ProjGravAnchorObs-TransformerVAE-NMMLP-v0"
+TASK_PROJ_GRAV_ANCHOR_EE_OBS_TRANSFORMER_VAE = "Tracking-Flat-G1-ProjGravAnchorEEObs-TransformerVAE-NMMLP-v0"
 SUPPORTED_TASKS = (
     TASK_PROJ_GRAV_OBS,
     TASK_PROJ_GRAV_ANCHOR_OBS,
     TASK_PROJ_GRAV_ANCHOR_OBS_MOTION_AE,
     TASK_PROJ_GRAV_ANCHOR_EE_OBS,
     TASK_PROJ_GRAV_ANCHOR_OBS_TRANSFORMER_VAE,
+    TASK_PROJ_GRAV_ANCHOR_EE_OBS_TRANSFORMER_VAE,
 )
 
 PROJ_GRAV_OBS_TERMS = (
@@ -165,6 +167,7 @@ TASK_OBSERVATION_TERMS = {
     TASK_PROJ_GRAV_ANCHOR_OBS_MOTION_AE: PROJ_GRAV_ANCHOR_OBS_TERMS,
     TASK_PROJ_GRAV_ANCHOR_EE_OBS: PROJ_GRAV_ANCHOR_EE_OBS_TERMS,
     TASK_PROJ_GRAV_ANCHOR_OBS_TRANSFORMER_VAE: PROJ_GRAV_ANCHOR_OBS_TERMS,
+    TASK_PROJ_GRAV_ANCHOR_EE_OBS_TRANSFORMER_VAE: PROJ_GRAV_ANCHOR_EE_OBS_TERMS,
 }
 FUTURE_TERM_DIMS = {
     "motion_anchor_pos_b": ANCHOR_POS_DIM_PER_STEP,
@@ -539,9 +542,10 @@ def _candidate_tasks_from_observation_names(observation_names):
             TASK_PROJ_GRAV_ANCHOR_OBS_MOTION_AE,
             TASK_PROJ_GRAV_ANCHOR_EE_OBS,
             TASK_PROJ_GRAV_ANCHOR_OBS_TRANSFORMER_VAE,
+            TASK_PROJ_GRAV_ANCHOR_EE_OBS_TRANSFORMER_VAE,
         ]
         if "motion_ee_pos_b" in names or "motion_ee_ori_b" in names:
-            return [TASK_PROJ_GRAV_ANCHOR_EE_OBS]
+            return [TASK_PROJ_GRAV_ANCHOR_EE_OBS, TASK_PROJ_GRAV_ANCHOR_EE_OBS_TRANSFORMER_VAE]
         return candidates
     if "projected_gravity" in names:
         return [TASK_PROJ_GRAV_OBS]
@@ -618,7 +622,7 @@ def _term_dims(observation_terms, task=None):
         if term == "command":
             if task in (TASK_PROJ_GRAV_ANCHOR_OBS_MOTION_AE, TASK_PROJ_GRAV_ANCHOR_EE_OBS):
                 fixed_dim += MOTION_AE_LATENT_DIM
-            elif task == TASK_PROJ_GRAV_ANCHOR_OBS_TRANSFORMER_VAE:
+            elif task in (TASK_PROJ_GRAV_ANCHOR_OBS_TRANSFORMER_VAE, TASK_PROJ_GRAV_ANCHOR_EE_OBS_TRANSFORMER_VAE):
                 fixed_dim += MOTION_TRANSFORMER_VAE_LATENT_DIM
             else:
                 per_step_dim += COMMAND_DIM_PER_STEP
@@ -1507,7 +1511,7 @@ if __name__ == "__main__":
             encoder_onnx_path=args.motion_ae_encoder_onnx_path,
             batch_size=args.motion_ae_batch_size,
         )
-    elif task == TASK_PROJ_GRAV_ANCHOR_OBS_TRANSFORMER_VAE:
+    elif task in (TASK_PROJ_GRAV_ANCHOR_OBS_TRANSFORMER_VAE, TASK_PROJ_GRAV_ANCHOR_EE_OBS_TRANSFORMER_VAE):
         motion_transformer_vae_adapter = MotionTransformerVAEOnnxLatentAdapter(
             project_root=args.motion_transformer_vae_project_root,
             config_path=args.motion_transformer_vae_config_path,

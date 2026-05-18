@@ -2,7 +2,7 @@ from isaaclab.utils import configclass
 
 from textop_tracker.robots.g1 import G1_ACTION_SCALE, G1_CYLINDER_CFG
 from textop_tracker.tasks.tracking.config.g1.agents.rsl_rl_ppo_cfg import LOW_FREQ_SCALE
-from textop_tracker.tasks.tracking.tracking_env_cfg import TrackingEnvCfg, PrivPrivObservationsCfg, PropPropObservationsCfg, NoisePrivObservationsCfg, ProjGravObservationsCfg, ProjGravAnchorObsObservationsCfg, ProjGravAnchorEEObsObservationsCfg
+from textop_tracker.tasks.tracking.tracking_env_cfg import TrackingEnvCfg, PrivPrivObservationsCfg, PropPropObservationsCfg, NoisePrivObservationsCfg, ProjGravObservationsCfg, ProjGravAnchorObsObservationsCfg, ProjGravAnchorEEObsObservationsCfg, ProjGravAnchorEEObsTransformerVAERewardsCfg
 
 
 @configclass
@@ -164,6 +164,17 @@ class G1FlatProjGravAnchorObsTransformerVAEEnvCfg(G1FlatProjGravAnchorObsEnvCfg)
     def __post_init__(self):
         super().__post_init__()
         self.commands.motion.future_steps = 10
+        self.commands.motion.motion_transformer_vae_enabled = True
+        self.commands.motion.motion_transformer_vae_latent_mode = "z_c"
+
+
+@configclass
+class G1FlatProjGravAnchorEEObsTransformerVAEEnvCfg(G1FlatProjGravAnchorEEObsEnvCfg):
+    rewards: ProjGravAnchorEEObsTransformerVAERewardsCfg = ProjGravAnchorEEObsTransformerVAERewardsCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.commands.motion.motion_ae_enabled = False
         self.commands.motion.motion_transformer_vae_enabled = True
         self.commands.motion.motion_transformer_vae_latent_mode = "z_c"
 
