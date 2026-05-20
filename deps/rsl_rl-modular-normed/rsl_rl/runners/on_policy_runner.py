@@ -29,6 +29,14 @@ from rsl_rl.utils import store_code_state
 
 class OnPolicyRunner:
     """On-policy runner for training and evaluation."""
+
+    def _ddp_debug(self, message: str) -> None:
+        if os.environ.get("TEXTOP_DDP_DEBUG", "0").lower() not in {"", "0", "false", "no", "off"}:
+            rank = os.environ.get("RANK", "0")
+            world_size = os.environ.get("WORLD_SIZE", "1")
+            local_rank = os.environ.get("LOCAL_RANK", "0")
+            print(f"[DDP][rank {rank}/{world_size} local_rank={local_rank}][runner] {message}", flush=True)
+
     def __init__(self, env: VecEnv, train_cfg: dict, log_dir: str | None = None, device="cpu"):
         self.cfg = train_cfg
         self.alg_cfg = train_cfg["algorithm"]
@@ -37,7 +45,9 @@ class OnPolicyRunner:
         self.env = env
 
         # check if multi-gpu is enabled
+        self._ddp_debug("configuring multi-gpu")
         self._configure_multi_gpu()
+        self._ddp_debug("multi-gpu configured")
 
         # resolve training type depending on the algorithm
         if self.alg_cfg["class_name"] == "PPO" or self.alg_cfg["class_name"] == "PPO_MNMLP":
@@ -52,11 +62,13 @@ class OnPolicyRunner:
         # - old API: obs, extras = env.get_observations()
         # - new API: obs_dict / TensorDict = env.get_observations()
         # ---------------------------------------------------------------------
+        self._ddp_debug("getting initial observations")
         obs_ret = self.env.get_observations()
         obs_dict, extras = self._parse_obs_return(obs_ret)
 
         obs = self._get_policy_obs(obs_dict)
         num_obs = obs.shape[1]
+        self._ddp_debug(f"policy obs dim={num_obs}")
 
         # resolve type of privileged observations
         if self.training_type == "rl":
@@ -75,12 +87,15 @@ class OnPolicyRunner:
         # resolve dimensions of privileged observations
         privileged_obs = self._get_privileged_obs(obs_dict, extras, self.privileged_obs_type, obs)
         num_privileged_obs = privileged_obs.shape[1]
+        self._ddp_debug(f"privileged obs dim={num_privileged_obs} actions={self.env.num_actions}")
 
         # evaluate the policy class
         policy_class = eval(self.policy_cfg.pop("class_name"))
+        self._ddp_debug(f"building policy class={policy_class.__name__}")
         policy: ActorCritic | ActorCriticRecurrent | ActorCriticMNMLP | StudentTeacher | StudentTeacherRecurrent = (
             policy_class(num_obs, num_privileged_obs, self.env.num_actions, **self.policy_cfg).to(self.device)
         )
+        self._ddp_debug("policy built and moved to device")
 
         # resolve dimension of rnd gated state
         if "rnd_cfg" in self.alg_cfg and self.alg_cfg["rnd_cfg"] is not None:
@@ -99,9 +114,11 @@ class OnPolicyRunner:
 
         # initialize algorithm
         alg_class = eval(self.alg_cfg.pop("class_name"))
+        self._ddp_debug(f"building algorithm class={alg_class.__name__}")
         self.alg: PPO | Distillation = alg_class(
             policy, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg
         )
+        self._ddp_debug("algorithm built")
 
         # store training configuration
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
@@ -117,6 +134,7 @@ class OnPolicyRunner:
             self.privileged_obs_normalizer = torch.nn.Identity().to(self.device)  # no normalization
 
         # init storage and model
+        self._ddp_debug("initializing rollout storage")
         self.alg.init_storage(
             self.training_type,
             self.env.num_envs,
@@ -125,6 +143,7 @@ class OnPolicyRunner:
             [num_privileged_obs],
             [self.env.num_actions],
         )
+        self._ddp_debug("rollout storage initialized")
 
         # Decide whether to disable logging
         # We only log from the process with rank 0 (main process)
@@ -200,8 +219,10 @@ class OnPolicyRunner:
 
         # Ensure all parameters are in-synced
         if self.is_distributed:
-            print(f"Synchronizing parameters for rank {self.gpu_global_rank}...")
+            print(f"Synchronizing parameters for rank {self.gpu_global_rank}...", flush=True)
+            self._ddp_debug("broadcasting parameters")
             self.alg.broadcast_parameters()
+            self._ddp_debug("parameters synchronized")
             # TODO: Do we need to synchronize empirical normalizers?
             # Right now: No, because they all should converge to the same values "asymptotically".
 
@@ -622,9 +643,16 @@ class OnPolicyRunner:
                 f"Global rank '{self.gpu_global_rank}' is greater than or equal to world size '{self.gpu_world_size}'."
             )
 
-        torch.distributed.init_process_group(
-            backend="nccl",
-            rank=self.gpu_global_rank,
-            world_size=self.gpu_world_size,
-        )
         torch.cuda.set_device(self.gpu_local_rank)
+        if not torch.distributed.is_initialized():
+            backend = os.environ.get("TEXTOP_DDP_BACKEND", "nccl").lower()
+            init_kwargs = {
+                "backend": backend,
+                "rank": self.gpu_global_rank,
+                "world_size": self.gpu_world_size,
+            }
+            if backend == "nccl":
+                init_kwargs["device_id"] = torch.device(f"cuda:{self.gpu_local_rank}")
+            torch.distributed.init_process_group(
+                **init_kwargs,
+            )

@@ -59,6 +59,22 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 import textop_tracker.tasks  # noqa: F401
 from textop_tracker.utils.exporter import attach_onnx_metadata, export_motion_policy_as_onnx
 
+try:
+    from isaaclab.utils.io.pkl import load_pickle
+except ImportError:
+    load_pickle = None
+
+
+def load_config(resume_path: str) -> tuple[ManagerBasedRLEnvCfg, RslRlOnPolicyRunnerCfg]:
+    """Load the config from the resume path."""
+    if load_pickle is None:
+        raise ImportError("isaaclab.utils.io.pkl.load_pickle is unavailable in this IsaacLab install")
+    param_dir = Path(resume_path).parent / "params"
+    env_cfg = load_pickle(str(param_dir / "env.pkl"))
+    agent_cfg = load_pickle(str(param_dir / "agent.pkl"))
+    return env_cfg, agent_cfg
+
+
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
     """Export policy to ONNX format."""

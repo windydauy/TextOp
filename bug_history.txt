@@ -115,3 +115,17 @@ how oom:
   是这次 GPU1 OOM 的直接原因。当前 GPU1 是空的，但按现有加载策略重新跑仍然大概率会 OOM。
    GR00T 这边的 motion_lib 很大，初筛能看到它不是简单一次性 npz -> GPU list，而是有“当前 motion batch / active motion
   ids / dataset id 映射”的设计。
+
+  • /root/autodl-fs/yzh/g1_before_2023 统计结果：
+
+  - .npz 文件数：20,306
+  - 总 frame 数：7,559,295
+  - 所有文件的 fps 都是 50，没有发现非 50 FPS 文件
+  - 按 50 frames/sec 换算：
+      - 总秒数：151,185.9 s
+      - 总小时数：41.996 h
+      - 约等于：42.0 小时
+      - 更精确是约 41 小时 59 分 46 秒
+
+  我用的是 joint_pos.shape[0] 作为每个 motion 的 frame 数；抽样看
+  body_pos_w.shape[0] 也是同一个时间维。

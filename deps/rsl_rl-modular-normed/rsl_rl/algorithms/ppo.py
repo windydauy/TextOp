@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -432,18 +433,32 @@ class PPO:
     Helper functions
     """
 
+    def _use_cpu_collectives(self) -> bool:
+        if not torch.distributed.is_initialized():
+            return False
+        backend = str(torch.distributed.get_backend()).lower()
+        env_value = os.environ.get("TEXTOP_DDP_CPU_COLLECTIVES", "0").lower()
+        return backend == "gloo" or env_value in {"1", "true", "yes", "on"}
+
+    def _broadcast_tensor(self, tensor: torch.Tensor) -> None:
+        if self._use_cpu_collectives():
+            if self.gpu_global_rank == 0:
+                cpu_tensor = tensor.detach().cpu().contiguous()
+            else:
+                cpu_tensor = torch.empty(tuple(tensor.shape), dtype=tensor.dtype, device="cpu")
+            torch.distributed.broadcast(cpu_tensor, src=0)
+            if self.gpu_global_rank != 0:
+                tensor.data.copy_(cpu_tensor.to(device=tensor.device))
+            return
+        torch.distributed.broadcast(tensor.data, src=0)
+
     def broadcast_parameters(self):
         """Broadcast model parameters to all GPUs."""
-        # obtain the model parameters on current GPU
-        model_params = [self.policy.state_dict()]
+        for tensor in chain(self.policy.parameters(), self.policy.buffers()):
+            self._broadcast_tensor(tensor)
         if self.rnd:
-            model_params.append(self.rnd.predictor.state_dict())
-        # broadcast the model parameters
-        torch.distributed.broadcast_object_list(model_params, src=0)
-        # load the model parameters on all GPUs from source GPU
-        self.policy.load_state_dict(model_params[0])
-        if self.rnd:
-            self.rnd.predictor.load_state_dict(model_params[1])
+            for tensor in chain(self.rnd.predictor.parameters(), self.rnd.predictor.buffers()):
+                self._broadcast_tensor(tensor)
 
     def reduce_parameters(self):
         """Collect gradients from all GPUs and average them.
@@ -451,26 +466,27 @@ class PPO:
         This function is called after the backward pass to synchronize the gradients across all GPUs.
         """
         # Create a tensor to store the gradients
-        grads = [param.grad.view(-1) for param in self.policy.parameters() if param.grad is not None]
+        params_with_grads = [param for param in self.policy.parameters() if param.grad is not None]
         if self.rnd:
-            grads += [param.grad.view(-1) for param in self.rnd.parameters() if param.grad is not None]
+            params_with_grads += [param for param in self.rnd.parameters() if param.grad is not None]
+        if self._use_cpu_collectives():
+            grads = [param.grad.detach().view(-1).cpu() for param in params_with_grads]
+        else:
+            grads = [param.grad.view(-1) for param in params_with_grads]
         all_grads = torch.cat(grads)
 
         # Average the gradients across all GPUs
         torch.distributed.all_reduce(all_grads, op=torch.distributed.ReduceOp.SUM)
         all_grads /= self.gpu_world_size
 
-        # Get all parameters
-        all_params = self.policy.parameters()
-        if self.rnd:
-            all_params = chain(all_params, self.rnd.parameters())
-
         # Update the gradients for all parameters with the reduced gradients
         offset = 0
-        for param in all_params:
-            if param.grad is not None:
-                numel = param.numel()
-                # copy data back from shared buffer
-                param.grad.data.copy_(all_grads[offset : offset + numel].view_as(param.grad.data))
-                # update the offset for the next parameter
-                offset += numel
+        for param in params_with_grads:
+            numel = param.numel()
+            # copy data back from shared buffer
+            grad_view = all_grads[offset : offset + numel].view_as(param.grad.data)
+            if grad_view.device != param.grad.device:
+                grad_view = grad_view.to(device=param.grad.device)
+            param.grad.data.copy_(grad_view)
+            # update the offset for the next parameter
+            offset += numel
