@@ -87,3 +87,7 @@ def test_transformer_vae_eeobs_tracker_task_rewards_and_deploy_are_wired() -> No
         assert f"{disabled_reward} = None" in reward_cfg_body
     assert "TASK_PROJ_GRAV_ANCHOR_EE_OBS_TRANSFORMER_VAE" in deploy_src
     assert "TASK_PROJ_GRAV_ANCHOR_EE_OBS_TRANSFORMER_VAE" in eval_src
+
+    ee_terms_block = deploy_src.split("PROJ_GRAV_ANCHOR_EE_OBS_TERMS = (", 1)[1].split(")", 1)[0]
+    assert ee_terms_block.index('"actions"') < ee_terms_block.index('"motion_ee_pos_b"')
+    assert ee_terms_block.index('"motion_ee_pos_b"') < ee_terms_block.index('"motion_ee_ori_b"')

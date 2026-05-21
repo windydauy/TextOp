@@ -152,14 +152,14 @@ PROJ_GRAV_ANCHOR_EE_OBS_TERMS = (
     "motion_anchor_ori_b",
     "robot_anchor_pos_w",
     "robot_anchor_ori_w",
-    "motion_ee_pos_b",
-    "motion_ee_ori_b",
     "projected_gravity",
     "base_lin_vel",
     "base_ang_vel",
     "joint_pos",
     "joint_vel",
     "actions",
+    "motion_ee_pos_b",
+    "motion_ee_ori_b",
 )
 TASK_OBSERVATION_TERMS = {
     TASK_PROJ_GRAV_OBS: PROJ_GRAV_OBS_TERMS,
@@ -1551,7 +1551,8 @@ if __name__ == "__main__":
     # d.qpos[3:7] = ori_yaw
     # breakpoint()
     d.qpos[3:7] = motion_loader.body_ori[0][motion_loader.anchor_body_index]
-    mujoco.mj_step(m, d)
+    mujoco.mj_forward(m, d)
+    target_dof_pos = motion_loader.joint_pos[0][isaaclab_to_mujoco_reindex].astype(np.float32, copy=True)
 
     # with mujoco.viewer.launch_passive(m, d) as viewer:
     start = time.time()

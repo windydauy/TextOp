@@ -127,7 +127,10 @@ class TerminationTracker:
             "global_mpjpe": values["global_mpjpe"] > self.args.global_mpjpe_fail,
             "local_mpjpe": values["local_mpjpe"] > self.args.local_mpjpe_fail,
             "anchor_global_pos": values["anchor_global_pos_error"] > self.args.anchor_global_pos_fail,
-            "ee_global_pos": values["max_ee_global_pos_error"] > self.args.ee_global_pos_fail,
+            "ee_global_pos": (
+                self.args.ee_global_pos_fail > 0
+                and values["max_ee_global_pos_error"] > self.args.ee_global_pos_fail
+            ),
         }
         for reason, failed in reasons.items():
             self.counts[reason] = self.counts[reason] + 1 if failed else 0
@@ -245,11 +248,11 @@ def evaluate_motion(
     )
 
     action = np.zeros(dm.NUM_ACTIONS, dtype=np.float32)
-    target_dof_pos = dm.default_angles.copy()
+    target_dof_pos = motion_loader.joint_pos[0][dm.isaaclab_to_mujoco_reindex].astype(np.float32, copy=True)
     data.qpos[7:] = motion_loader.joint_pos[0][dm.isaaclab_to_mujoco_reindex]
     data.qpos[:3] = motion_loader.body_pos[0][motion_loader.anchor_body_index]
     data.qpos[3:7] = motion_loader.body_ori[0][motion_loader.anchor_body_index]
-    mujoco.mj_step(model, data)
+    mujoco.mj_forward(model, data)
 
     metrics = MetricAccumulator()
     termination = TerminationTracker(args)
