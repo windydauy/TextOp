@@ -1,0 +1,205 @@
+================================================================================
+TextOp Tracker — EE Reward 与 Body Tracking Reward 总结
+================================================================================
+（汇总：SplitBody EE reward 变量提取流程 + 原版 motion_body_pos reward 说明）
+
+--------------------------------------------------------------------------------
+一、配置背景
+--------------------------------------------------------------------------------
+
+1. ProjGravAnchorEEObsSplitBodyTransformerVAERewardsCfg
+   - 用途：TransformerVAE + EEObs 任务的 split body reward 配置
+   - 环境：G1FlatProjGravAnchorEEObsTransformerVAESplitBodyRewardEnvCfg
+   - 任务 ID：Tracking-Flat-G1-ProjGravAnchorEEObs-TransformerVAE-SplitBodyReward-NMMLP-v0
+
+2. Body 分组
+   - 非 EE（10 个）：pelvis, hip, knee, torso, shoulder, elbow（左右）
+   - EE（4 个）：left/right_wrist_yaw_link, left/right_ankle_roll_link
+
+3. 权重重平衡
+   - _ALL_TRACKED_BODY_COUNT = 14
+   - _NON_EE_BODY_REWARD_WEIGHT = 10/14 ≈ 0.714
+   - _EE_BODY_REWARD_WEIGHT     = 4/14  ≈ 0.286
+   - 目的：拆分后各组总权重与原来 14 body 一起算时按 body 数量比例一致
+
+4. SplitBody 显式关闭的 reward
+   - feet_slide, soft_landing, overspeed, overeffort = None
+
+5. SplitBody reward 结构（简化）
+   R = 0.5·anchor_pos + 0.5·anchor_ori
+     + (10/14)·[non_EE: pos, ori, lin_vel, ang_vel]
+     + (4/14)·[EE: rel_pos, rel_ori, lin_vel, ang_vel]   ← motion_future_obs_* 函数
+     + 1.0·[EE: global_pos, global_ori]                  ← motion_future_obs_* 函数
+     - 0.1·action_rate - 10·joint_limit - 0.1·undesired_contacts
+
+--------------------------------------------------------------------------------
+二、原版 motion_relative_body_position_error_exp（rewards.py 150-158）
+--------------------------------------------------------------------------------
+
+【Reward 公式】
+  error = sum( (body_pos_relative_w - robot_body_pos_w)^2 )  对 xyz 求和
+  reward = exp( - mean(error over bodies) / std^2 )           std=0.3
+
+【robot_body_pos_w — 机器人实际位置】
+  来源：Isaac Sim → robot.data.body_pos_w[:, body_indexes]
+  坐标系：世界系 (world)
+  含义：仿真中 robot 各 tracking body 当前真实世界坐标
+  Shape：(num_envs, num_bodies, 3)
+
+【body_pos_relative_w — warp 后的 reference 目标位置】
+  注意：名字带 relative，但结果仍在 world 系，不是 body frame。
+
+  原始 reference（当前帧 time_steps）：
+    body_pos_w   ← motion npz buffer + env_origins（各 body world 位置）
+    anchor_pos_w ← buffer 中 anchor body（G1: torso_link）world 位置
+
+  每步 _update_command() 中 warp（commands_multi.py）：
+    delta_pos_w = robot_anchor_pos_w
+    delta_pos_w[..., 2] = anchor_pos_w[..., 2]    # XY 跟 robot，Z 跟 reference
+    delta_ori_w = yaw_quat( robot_anchor_quat * inv(anchor_quat) )  # 只取 yaw 差
+
+    body_pos_relative_w = delta_pos_w + quat_apply( delta_ori_w, body_pos_w - anchor_pos_w )
+
+  几何含义（三步）：
+    1. body_pos_w - anchor_pos_w     → 各 body 相对 reference anchor 的偏移
+    2. quat_apply(delta_ori_w, ·)    → 按 robot/ref anchor 的 yaw 差旋转
+    3. + delta_pos_w                 → 平移到 warp 后的 anchor 位置
+
+【这项 reward 的意义】
+  - 优化目标：在允许 global XY / yaw 漂移的前提下，让各 body 相对构型跟上 reference
+  - anchor pos/ori reward 管 torso 全局位姿；body pos/ori reward 管手脚躯干相对构型
+  - XY 跟随 robot anchor，Z 跟随 reference anchor，yaw 对齐后比较 world 坐标
+  - 未传 body_names 时默认对全部 14 个 tracking body 计算
+
+【与姿态 reward 配对】
+  motion_relative_body_orientation_error_exp 使用：
+    body_quat_relative_w vs robot_body_quat_w（同样经 yaw warp）
+
+--------------------------------------------------------------------------------
+三、EE reward 变量提取流程（SplitBody — motion_future_obs_*）
+--------------------------------------------------------------------------------
+
+【入口函数】
+  _future_ee_reference_from_obs_layout(env, command, body_names)
+  6 个 EE reward 均先调用此函数，再与 robot 状态对比。
+
+【Layer 0 — 原始数据】
+  A. Reference motion
+     motion .npz → MultiMotionLoader → body_pos_w_buffer / body_quat_w_buffer
+     读时加 env_origins 变 world 系
+
+  B. Robot 仿真状态
+     robot.data.body_pos_w / body_quat_w / body_lin_vel_w / body_ang_vel_w
+     经 MotionCommand.body_indexes 映射到 14 个 tracking body
+
+【Layer 1 — Body index】
+  body_names = 4 个 EE link
+  body_indexes = [cfg.body_names.index(name) for name in body_names]
+
+【Layer 2 — Future N-step 参考 pose】
+  future_body_pos_w, future_body_quat_w = command.future_body_pos_quat_w(body_indexes)
+    - 从 buffer 取 time_steps, time_steps+1, ... time_steps+future_steps-1
+    - Shape: (N, T, 4, 3/4)，T = future_steps（通常 10）
+
+  future_anchor_pos_w = command.motion_anchor_pos.view(N, T, 3)
+  future_anchor_quat_w = command.motion_anchor_quat.view(N, T, 4)
+    - reference anchor (torso) 的 future world pose
+
+  robot_anchor_pos_w, robot_anchor_quat_w
+    - 当前时刻 robot torso 世界位姿（单帧，非 future）
+
+【Layer 3 — _future_ee_reference_from_obs_layout 变换链】
+
+  Step 1 — EE 变换到 robot anchor 系（与 obs motion_ee_pos_b_future 一致）
+    body_pos_b, body_quat_b = subtract_frame_transforms(
+        robot_anchor, future_body_pos_w, future_body_quat_w)
+
+  Step 2 — Reference anchor 变换到 robot anchor 系（与 obs motion_anchor_pos_b_future 一致）
+    anchor_pos_b, anchor_quat_b = subtract_frame_transforms(
+        robot_anchor, future_anchor_pos_w, future_anchor_quat_w)
+
+  Step 3 — 重建 effective reference anchor（world）
+    ref_anchor_rot_w = R(robot_anchor) @ R(anchor_rot_b)
+    ref_anchor_pos_w = robot_anchor_pos_w + R(robot_anchor) @ anchor_pos_b
+    （以 robot 当前 anchor 为基准，叠加 future anchor 相对偏移）
+
+  Step 4 — EE 相对 reference anchor 的 pose
+    body_pos_rel_anchor = R(anchor_rot_b)^T @ (body_pos_b - anchor_pos_b)
+    body_rot_rel_anchor = R(anchor_rot_b)^T @ R(body_rot_b)
+
+  Step 5 — 重建 EE world target
+    body_pos_w = ref_anchor_pos_w + R(ref_anchor_rot_w) @ body_pos_rel_anchor
+    body_rot_w = R(ref_anchor_rot_w) @ body_rot_rel_anchor
+
+  Step 6 — EE world 速度（差分，非 npz 预存速度）
+    if future_steps > 1:
+      body_lin_vel_w = (body_pos_w[:,1] - body_pos_w[:,0]) / step_dt
+      body_ang_vel_w = rotation_vector(body_rot_w[:,1] @ body_rot_w[:,0]^T) / step_dt
+    else:
+      速度全零（future_steps=1 时 EE 速度 reward 无效）
+
+  Step 7 — 输出（pos/ori 取 future step 0）
+    body_pos_rel_anchor, body_rot_rel_anchor  (N, 4, ...)
+    body_pos_w, body_rot_w                      (N, 4, ...)
+    body_lin_vel_w, body_ang_vel_w              (N, 4, 3)
+
+【Layer 4 — Robot 侧（各 reward 按需取用）】
+  robot_body_pos_w / quat_w / lin_vel_w / ang_vel_w  ← 仿真 world 系
+  robot_body_pos_b / rot_b  ← EE 变换到 robot anchor 系（relative reward 用）
+
+【Layer 5 — 6 个 EE reward 变量对照】
+
+  Reward                          Reference (target)           Robot (actual)              坐标系
+  -------------------------------------------------------------------------------------------------
+  motion_ee_body_pos              body_pos_rel_anchor          robot_body_pos_b            ref-anchor vs robot-anchor
+  motion_ee_body_ori              body_rot_rel_anchor          robot_body_rot_b            同上
+  motion_ee_global_body_pos       body_pos_w                   robot_body_pos_w            world
+  motion_ee_global_body_ori       body_rot_w                   robot_body_quat_w→matrix    world
+  motion_ee_body_lin_vel          body_lin_vel_w (差分)        robot_body_lin_vel_w        world
+  motion_ee_body_ang_vel          body_ang_vel_w (差分)        robot_body_ang_vel_w        world
+
+  统一形式：exp( - mean_error_over_4_EE / std^2 )
+
+【Observation 与 Reward 对应】
+  motion_ee_pos_b_future      ← Step 1 body_pos_b（policy 直接看到）
+  motion_ee_ori_b_future      ← Step 1 body_quat_b
+  motion_anchor_pos_b_future  ← Step 2 anchor_pos_b（间接用于重建 ref_anchor）
+  motion_anchor_ori_b_future  ← Step 2 anchor_quat_b
+
+  Reward 在 Step 3-5 进一步重建 ref anchor 和 world target，比 obs 多几步变换。
+
+--------------------------------------------------------------------------------
+四、SplitBody 中非 EE 与 EE 的对比
+--------------------------------------------------------------------------------
+
+  维度              非 EE (motion_body_*)              EE (motion_future_obs_*)
+  -----------------------------------------------------------------------------------------------
+  body 范围         _NON_EE_BODY_NAMES (10)            _EE_BODY_NAMES (4)
+  weight            10/14                              4/14（+ global EE 额外 1.0×2）
+  时间              当前 time_steps 单帧               future horizon step 0
+  pos/ori 参考      body_pos_relative_w (anchor warp)  future obs 重建 target
+  vel 参考          npz body_lin_vel_w / ang_vel_w     重建 world pose 的 0→1 差分
+  robot 侧          robot_body_*_w (world)             world 或 robot anchor 系
+
+--------------------------------------------------------------------------------
+五、关键注意点
+--------------------------------------------------------------------------------
+
+1. body_pos_relative_w 仍在 world 系，是相对 anchor warp 后的 world target，不是 body frame。
+2. EE reward 的 reference 不是 raw npz body_pos_w，而是经 robot 当前 anchor 重建的 target。
+3. EE pos/ori 用 future step 0；速度用 step 0→1 差分；future_steps=1 时速度 reward 为 0。
+4. 原版 motion_body_pos 未传 body_names 时对全部 14 body 计算；SplitBody 拆成 10+4 避免 EE 被稀释。
+5. EE 会被算两次：4/14 权重的 relative/vel + 1.0 权重的 global pos/ori。
+6. EE relative pos reward 中 body_pos_rel_anchor 与 robot_body_pos_b 严格说不是同一坐标系；
+   anchor 跟踪较好时近似可比；global reward 无此问题。
+
+================================================================================
+文件位置参考
+================================================================================
+  tracking_env_cfg.py     — RewardsCfg, SplitBody/TransformerVAE reward 配置
+  mdp/rewards.py          — reward 函数 + _future_ee_reference_from_obs_layout
+  mdp/commands_multi.py   — MotionCommand, buffer, body_pos_relative_w warp
+  mdp/observations.py     — motion_body_pos_b_future 等 EE observation
+  config/g1/flat_env_cfg.py — G1 环境与 body_names 配置
+
+================================================================================

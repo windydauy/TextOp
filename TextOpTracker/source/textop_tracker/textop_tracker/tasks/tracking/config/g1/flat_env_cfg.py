@@ -2,7 +2,17 @@ from isaaclab.utils import configclass
 
 from textop_tracker.robots.g1 import G1_ACTION_SCALE, G1_CYLINDER_CFG
 from textop_tracker.tasks.tracking.config.g1.agents.rsl_rl_ppo_cfg import LOW_FREQ_SCALE
-from textop_tracker.tasks.tracking.tracking_env_cfg import TrackingEnvCfg, PrivPrivObservationsCfg, PropPropObservationsCfg, NoisePrivObservationsCfg, ProjGravObservationsCfg, ProjGravAnchorObsObservationsCfg, ProjGravAnchorEEObsObservationsCfg, ProjGravAnchorEEObsTransformerVAERewardsCfg
+from textop_tracker.tasks.tracking.tracking_env_cfg import (
+    NoisePrivObservationsCfg,
+    PrivPrivObservationsCfg,
+    ProjGravAnchorEEObsObservationsCfg,
+    ProjGravAnchorEEObsSplitBodyTransformerVAERewardsCfg,
+    ProjGravAnchorEEObsTransformerVAERewardsCfg,
+    ProjGravAnchorObsObservationsCfg,
+    ProjGravObservationsCfg,
+    PropPropObservationsCfg,
+    TrackingEnvCfg,
+)
 
 
 @configclass
@@ -177,6 +187,23 @@ class G1FlatProjGravAnchorEEObsTransformerVAEEnvCfg(G1FlatProjGravAnchorEEObsEnv
         self.commands.motion.motion_ae_enabled = False
         self.commands.motion.motion_transformer_vae_enabled = True
         self.commands.motion.motion_transformer_vae_latent_mode = "z_c"
+
+
+@configclass
+class G1FlatProjGravAnchorEEObsTransformerVAESplitBodyRewardEnvCfg(G1FlatProjGravAnchorEEObsTransformerVAEEnvCfg):
+    """TransformerVAE EEObs tracker with split non-EE and EE rewards."""
+
+    rewards: ProjGravAnchorEEObsSplitBodyTransformerVAERewardsCfg = ProjGravAnchorEEObsSplitBodyTransformerVAERewardsCfg()
+    
+
+
+@configclass
+class G1FlatProjGravAnchorEEObsDirectRefMotionEnvCfg(G1FlatProjGravAnchorEEObsTransformerVAEEnvCfg):
+    """TransformerVAE EEObs tracker rewards with direct reference-motion commands."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.commands.motion.motion_transformer_vae_enabled = False
 
 
 @configclass

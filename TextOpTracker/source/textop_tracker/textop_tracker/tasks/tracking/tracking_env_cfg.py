@@ -243,6 +243,10 @@ _NON_EE_BODY_NAMES: list[str] = [
     "right_elbow_link",
 ]
 
+_ALL_TRACKED_BODY_COUNT = len(_NON_EE_BODY_NAMES) + len(_EE_BODY_NAMES)
+_NON_EE_BODY_REWARD_WEIGHT = len(_NON_EE_BODY_NAMES) / _ALL_TRACKED_BODY_COUNT
+_EE_BODY_REWARD_WEIGHT = len(_EE_BODY_NAMES) / _ALL_TRACKED_BODY_COUNT
+
 
 @configclass
 class ProjGravAnchorObsObservationsCfg:
@@ -710,6 +714,107 @@ class ProjGravAnchorEEObsTransformerVAERewardsCfg(RewardsCfg):
     )
     motion_ee_global_body_ori = RewTerm(
         func=mdp.motion_global_body_orientation_error_exp,
+        weight=1.0,
+        params={
+            "command_name": "motion",
+            "std": 0.4,
+            "body_names": _EE_BODY_NAMES,
+        },
+    )
+
+
+@configclass
+class ProjGravAnchorEEObsSplitBodyTransformerVAERewardsCfg(RewardsCfg):
+    """Split non-EE body tracking from EE tracking derived from future EE observation targets."""
+
+    feet_slide = None
+    soft_landing = None
+    overspeed = None
+    overeffort = None
+
+    motion_body_pos = RewTerm(
+        func=mdp.motion_relative_body_position_error_exp,
+        weight=_NON_EE_BODY_REWARD_WEIGHT,
+        params={
+            "command_name": "motion",
+            "std": 0.3,
+            "body_names": _NON_EE_BODY_NAMES,
+        },
+    )
+    motion_body_ori = RewTerm(
+        func=mdp.motion_relative_body_orientation_error_exp,
+        weight=_NON_EE_BODY_REWARD_WEIGHT,
+        params={
+            "command_name": "motion",
+            "std": 0.4,
+            "body_names": _NON_EE_BODY_NAMES,
+        },
+    )
+    motion_body_lin_vel = RewTerm(
+        func=mdp.motion_global_body_linear_velocity_error_exp,
+        weight=_NON_EE_BODY_REWARD_WEIGHT,
+        params={
+            "command_name": "motion",
+            "std": 1.0,
+            "body_names": _NON_EE_BODY_NAMES,
+        },
+    )
+    motion_body_ang_vel = RewTerm(
+        func=mdp.motion_global_body_angular_velocity_error_exp,
+        weight=_NON_EE_BODY_REWARD_WEIGHT,
+        params={
+            "command_name": "motion",
+            "std": 3.14,
+            "body_names": _NON_EE_BODY_NAMES,
+        },
+    )
+    motion_ee_body_pos = RewTerm(
+        func=mdp.motion_future_obs_relative_body_position_error_exp,
+        weight=_EE_BODY_REWARD_WEIGHT,
+        params={
+            "command_name": "motion",
+            "std": 0.3,
+            "body_names": _EE_BODY_NAMES,
+        },
+    )
+    motion_ee_body_ori = RewTerm(
+        func=mdp.motion_future_obs_relative_body_orientation_error_exp,
+        weight=_EE_BODY_REWARD_WEIGHT,
+        params={
+            "command_name": "motion",
+            "std": 0.4,
+            "body_names": _EE_BODY_NAMES,
+        },
+    )
+    motion_ee_body_lin_vel = RewTerm(
+        func=mdp.motion_future_obs_global_body_linear_velocity_error_exp,
+        weight=_EE_BODY_REWARD_WEIGHT,
+        params={
+            "command_name": "motion",
+            "std": 1.0,
+            "body_names": _EE_BODY_NAMES,
+        },
+    )
+    motion_ee_body_ang_vel = RewTerm(
+        func=mdp.motion_future_obs_global_body_angular_velocity_error_exp,
+        weight=_EE_BODY_REWARD_WEIGHT,
+        params={
+            "command_name": "motion",
+            "std": 3.14,
+            "body_names": _EE_BODY_NAMES,
+        },
+    )
+    motion_ee_global_body_pos = RewTerm(
+        func=mdp.motion_future_obs_global_body_position_error_exp,
+        weight=1.0,
+        params={
+            "command_name": "motion",
+            "std": 0.3,
+            "body_names": _EE_BODY_NAMES,
+        },
+    )
+    motion_ee_global_body_ori = RewTerm(
+        func=mdp.motion_future_obs_global_body_orientation_error_exp,
         weight=1.0,
         params={
             "command_name": "motion",

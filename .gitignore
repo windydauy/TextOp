@@ -193,6 +193,7 @@ _build
 *.zarr
 *.npz
 *.sh
+!scripts/train_direct_ref_motion_eeobs_g1_before_2023.sh
 kimomotion_dataset/*
 TextOp-Data/*
 artifacts/

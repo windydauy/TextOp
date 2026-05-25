@@ -174,6 +174,30 @@ gym.register(
 )
 
 gym.register(
+    id="Tracking-Flat-G1-ProjGravAnchorEEObs-TransformerVAE-SplitBodyReward-NMMLP-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point":
+        flat_env_cfg.G1FlatProjGravAnchorEEObsTransformerVAESplitBodyRewardEnvCfg,
+        "rsl_rl_cfg_entry_point":
+        f"{agents.__name__}.rsl_rl_ppo_cfg:G1FlatPPOModNormRunnerCfg",
+    },
+)
+
+gym.register(
+    id="Tracking-Flat-G1-ProjGravAnchorEEObs-DirectRefMotion-NMMLP-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point":
+        flat_env_cfg.G1FlatProjGravAnchorEEObsDirectRefMotionEnvCfg,
+        "rsl_rl_cfg_entry_point":
+        f"{agents.__name__}.rsl_rl_ppo_cfg:G1FlatPPOModNormRunnerCfg",
+    },
+)
+
+gym.register(
     id="Tracking-Flat-G1-Low-Freq-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
