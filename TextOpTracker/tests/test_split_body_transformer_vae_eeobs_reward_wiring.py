@@ -89,6 +89,8 @@ def test_split_body_transformer_vae_eeobs_reward_task_is_wired() -> None:
         assert reward_name in reward_cfg_body
     assert reward_cfg_body.count("weight=_EE_BODY_REWARD_WEIGHT") == 4
     assert reward_cfg_body.count('"body_names": _EE_BODY_NAMES') == 6
+    assert "motion_ee_body_pos = RewTerm(\n        func=mdp.motion_future_obs_relative_body_position_error_exp,\n        weight=_EE_BODY_REWARD_WEIGHT" in reward_cfg_body
+    assert "motion_ee_body_ori = RewTerm(\n        func=mdp.motion_future_obs_relative_body_orientation_error_exp,\n        weight=_EE_BODY_REWARD_WEIGHT" in reward_cfg_body
     assert "motion_ee_global_body_pos = RewTerm(\n        func=mdp.motion_future_obs_global_body_position_error_exp,\n        weight=1.0" in reward_cfg_body
     assert "motion_ee_global_body_ori = RewTerm(\n        func=mdp.motion_future_obs_global_body_orientation_error_exp,\n        weight=1.0" in reward_cfg_body
 
@@ -107,3 +109,38 @@ def test_split_body_transformer_vae_eeobs_reward_task_is_wired() -> None:
     assert "body_indexes = [command.cfg.body_names.index(name) for name in body_names]" in rewards_src
     assert "command.motion_anchor_pos.view(num_envs, future_steps, 3)" in rewards_src
     assert "command.motion_anchor_quat.view(num_envs, future_steps, 4)" in rewards_src
+
+    relative_ref_body = rewards_src.split("def _future_obs_relative_body_reference_w", 1)[1].split(
+        "\n\ndef reward_cond_on_pfail", 1
+    )[0]
+    assert "motion_ee_pos_b" in relative_ref_body
+    assert "motion_ee_ori_b" in relative_ref_body
+    assert "motion_anchor_pos_b" in relative_ref_body
+    assert "motion_anchor_ori_b" in relative_ref_body
+    assert "robot_anchor_pos_w_obs" in relative_ref_body
+    assert "robot_anchor_ori_w" in relative_ref_body
+    assert "obs_motion_body_pos_b_future" in relative_ref_body
+    assert "obs_motion_body_ori_b_future" in relative_ref_body
+    assert "obs_motion_anchor_pos_b_future" in relative_ref_body
+    assert "obs_motion_anchor_ori_b_future" in relative_ref_body
+    assert "obs_robot_anchor_pos_w" in relative_ref_body
+    assert "obs_robot_anchor_ori_w" in relative_ref_body
+    assert "command.future_body_pos_quat_w" not in relative_ref_body
+    assert "body_pos_relative_w" in relative_ref_body
+    assert "body_quat_relative_w" in relative_ref_body
+    assert "delta_pos_w[..., 2] = anchor_pos_w[:, None, 2]" in relative_ref_body
+    assert "delta_yaw_quat = yaw_quat" in relative_ref_body
+
+    relative_pos_body = rewards_src.split("def motion_future_obs_relative_body_position_error_exp", 1)[1].split(
+        "\n\ndef motion_future_obs_relative_body_orientation_error_exp", 1
+    )[0]
+    relative_ori_body = rewards_src.split("def motion_future_obs_relative_body_orientation_error_exp", 1)[1].split(
+        "\n\ndef motion_future_obs_global_body_position_error_exp", 1
+    )[0]
+    assert "_future_obs_relative_body_reference_w" in relative_pos_body
+    assert "_future_ee_reference_from_obs_layout" not in relative_pos_body
+    assert "ref[\"body_pos_relative_w\"] - command.robot_body_pos_w[:, body_indexes]" in relative_pos_body
+    assert "_future_obs_relative_body_reference_w" in relative_ori_body
+    assert "_future_ee_reference_from_obs_layout" not in relative_ori_body
+    assert "quat_error_magnitude(" in relative_ori_body
+    assert "ref[\"body_quat_relative_w\"], command.robot_body_quat_w[:, body_indexes]" in relative_ori_body

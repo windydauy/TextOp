@@ -7,8 +7,25 @@ from typing import Callable
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
 from isaaclab.assets import Articulation
-from isaaclab.utils.math import matrix_from_quat, quat_error_magnitude, subtract_frame_transforms
+from isaaclab.utils.math import (
+    matrix_from_quat,
+    quat_apply,
+    quat_error_magnitude,
+    quat_from_matrix,
+    quat_inv,
+    quat_mul,
+    subtract_frame_transforms,
+    yaw_quat,
+)
 from isaaclab.envs.mdp.rewards import contact_forces
+from textop_tracker.tasks.tracking.mdp.observations import (
+    motion_anchor_ori_b_future as obs_motion_anchor_ori_b_future,
+    motion_anchor_pos_b_future as obs_motion_anchor_pos_b_future,
+    motion_body_ori_b_future as obs_motion_body_ori_b_future,
+    motion_body_pos_b_future as obs_motion_body_pos_b_future,
+    robot_anchor_ori_w as obs_robot_anchor_ori_w,
+    robot_anchor_pos_w as obs_robot_anchor_pos_w,
+)
 from textop_tracker.tasks.tracking.mdp import MotionCommand
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -46,6 +63,23 @@ def _rotation_vector_from_matrix(rot: torch.Tensor) -> torch.Tensor:
 def _rotation_error_squared(ref_rot: torch.Tensor, robot_rot: torch.Tensor) -> torch.Tensor:
     delta = torch.matmul(ref_rot, robot_rot.transpose(-1, -2))
     return torch.sum(torch.square(_rotation_vector_from_matrix(delta)), dim=-1)
+
+
+def _matrix_from_obs_6d(first_two_columns: torch.Tensor) -> torch.Tensor:
+    rot_6d = first_two_columns.reshape(*first_two_columns.shape[:-1], 3, 2)
+    x_axis = rot_6d[..., :, 0]
+    y_axis = rot_6d[..., :, 1]
+    x_axis = x_axis / torch.clamp(torch.linalg.norm(x_axis, dim=-1, keepdim=True), min=1e-6)
+    y_axis = y_axis - torch.sum(x_axis * y_axis, dim=-1, keepdim=True) * x_axis
+    y_axis = y_axis / torch.clamp(torch.linalg.norm(y_axis, dim=-1, keepdim=True), min=1e-6)
+    z_axis = torch.cross(x_axis, y_axis, dim=-1)
+    return torch.stack((x_axis, y_axis, z_axis), dim=-1)
+
+
+def _get_obs_body_indexes(command: MotionCommand, body_names: list[str] | None) -> list[int]:
+    if body_names is None:
+        return list(range(len(command.cfg.body_names)))
+    return [command.cfg.body_names.index(name) for name in body_names]
 
 
 def _future_ee_reference_from_obs_layout(
@@ -112,6 +146,59 @@ def _future_ee_reference_from_obs_layout(
         "body_rot_w": body_rot_w[:, 0],
         "body_lin_vel_w": linear_velocity_w,
         "body_ang_vel_w": angular_velocity_w,
+    }
+
+
+def _future_obs_relative_body_reference_w(
+    env: ManagerBasedRLEnv,
+    command: MotionCommand,
+    command_name: str,
+    body_names: list[str] | None,
+) -> dict[str, torch.Tensor]:
+    """Build drift-tolerant body reference from the same terms exposed in EE future observations."""
+    obs_body_names = list(command.cfg.body_names) if body_names is None else body_names
+    body_indexes = _get_obs_body_indexes(command, body_names)
+    num_envs = env.num_envs
+    num_bodies = len(body_indexes)
+
+    motion_ee_pos_b = obs_motion_body_pos_b_future(env, command_name, obs_body_names).view(
+        num_envs, -1, num_bodies, 3
+    )
+    motion_ee_ori_b = obs_motion_body_ori_b_future(env, command_name, obs_body_names).view(
+        num_envs, -1, num_bodies, 6
+    )
+    motion_anchor_pos_b = obs_motion_anchor_pos_b_future(env, command_name).view(num_envs, -1, 3)
+    motion_anchor_ori_b = obs_motion_anchor_ori_b_future(env, command_name).view(num_envs, -1, 6)
+    robot_anchor_pos_w_obs = obs_robot_anchor_pos_w(env, command_name).view(num_envs, 3)
+    robot_anchor_ori_w = obs_robot_anchor_ori_w(env, command_name).view(num_envs, 6)
+    robot_anchor_rot_w = _matrix_from_obs_6d(robot_anchor_ori_w)
+    robot_anchor_quat_w_obs = quat_from_matrix(robot_anchor_rot_w)
+
+    body_pos_b = motion_ee_pos_b[:, 0]
+    body_rot_b = _matrix_from_obs_6d(motion_ee_ori_b[:, 0])
+    body_quat_b = quat_from_matrix(body_rot_b)
+    anchor_pos_b = motion_anchor_pos_b[:, 0]
+    anchor_rot_b = _matrix_from_obs_6d(motion_anchor_ori_b[:, 0])
+    anchor_quat_b = quat_from_matrix(anchor_rot_b)
+
+    robot_anchor_quat_body = robot_anchor_quat_w_obs[:, None, :].expand(-1, num_bodies, -1)
+    body_pos_w = robot_anchor_pos_w_obs[:, None, :] + quat_apply(robot_anchor_quat_body, body_pos_b)
+    body_quat_w = quat_mul(robot_anchor_quat_body, body_quat_b)
+    anchor_pos_w = robot_anchor_pos_w_obs + quat_apply(robot_anchor_quat_w_obs, anchor_pos_b)
+    anchor_quat_w = quat_mul(robot_anchor_quat_w_obs, anchor_quat_b)
+
+    delta_pos_w = robot_anchor_pos_w_obs[:, None, :].expand(-1, num_bodies, -1).clone()
+    delta_pos_w[..., 2] = anchor_pos_w[:, None, 2]
+    delta_yaw_quat = yaw_quat(quat_mul(robot_anchor_quat_w_obs, quat_inv(anchor_quat_w)))
+    delta_yaw_quat_body = delta_yaw_quat[:, None, :].expand(-1, num_bodies, -1)
+
+    body_pos_relative_w = delta_pos_w + quat_apply(delta_yaw_quat_body, body_pos_w - anchor_pos_w[:, None, :])
+    body_quat_relative_w = quat_mul(delta_yaw_quat_body, body_quat_w)
+
+    return {
+        "body_indexes": torch.tensor(body_indexes, device=body_pos_relative_w.device, dtype=torch.long),
+        "body_pos_relative_w": body_pos_relative_w,
+        "body_quat_relative_w": body_quat_relative_w,
     }
 
 
@@ -214,39 +301,26 @@ def motion_global_body_angular_velocity_error_exp(
 
 
 def motion_future_obs_relative_body_position_error_exp(
-    env: ManagerBasedRLEnv, command_name: str, std: float, body_names: list[str]
+    env: ManagerBasedRLEnv, command_name: str, std: float, body_names: list[str] | None = None
 ) -> torch.Tensor:
     command: MotionCommand = env.command_manager.get_term(command_name)
-    ref = _future_ee_reference_from_obs_layout(env, command, body_names)
+    ref = _future_obs_relative_body_reference_w(env, command, command_name, body_names)
     body_indexes = ref["body_indexes"]
-    robot_anchor_pos = command.robot_anchor_pos_w[:, None, :].expand(-1, len(body_indexes), -1)
-    robot_anchor_quat = command.robot_anchor_quat_w[:, None, :].expand(-1, len(body_indexes), -1)
-    robot_body_pos_b, _ = subtract_frame_transforms(
-        robot_anchor_pos,
-        robot_anchor_quat,
-        command.robot_body_pos_w[:, body_indexes],
-        command.robot_body_quat_w[:, body_indexes],
+    error = torch.sum(
+        torch.square(ref["body_pos_relative_w"] - command.robot_body_pos_w[:, body_indexes]), dim=-1
     )
-    error = torch.sum(torch.square(ref["body_pos_rel_anchor"] - robot_body_pos_b), dim=-1)
     return torch.exp(-error.mean(-1) / std**2)
 
 
 def motion_future_obs_relative_body_orientation_error_exp(
-    env: ManagerBasedRLEnv, command_name: str, std: float, body_names: list[str]
+    env: ManagerBasedRLEnv, command_name: str, std: float, body_names: list[str] | None = None
 ) -> torch.Tensor:
     command: MotionCommand = env.command_manager.get_term(command_name)
-    ref = _future_ee_reference_from_obs_layout(env, command, body_names)
+    ref = _future_obs_relative_body_reference_w(env, command, command_name, body_names)
     body_indexes = ref["body_indexes"]
-    robot_anchor_pos = command.robot_anchor_pos_w[:, None, :].expand(-1, len(body_indexes), -1)
-    robot_anchor_quat = command.robot_anchor_quat_w[:, None, :].expand(-1, len(body_indexes), -1)
-    _, robot_body_quat_b = subtract_frame_transforms(
-        robot_anchor_pos,
-        robot_anchor_quat,
-        command.robot_body_pos_w[:, body_indexes],
-        command.robot_body_quat_w[:, body_indexes],
-    )
-    robot_body_rot_b = matrix_from_quat(robot_body_quat_b)
-    error = _rotation_error_squared(ref["body_rot_rel_anchor"], robot_body_rot_b)
+    error = quat_error_magnitude(
+        ref["body_quat_relative_w"], command.robot_body_quat_w[:, body_indexes]
+    )**2
     return torch.exp(-error.mean(-1) / std**2)
 
 

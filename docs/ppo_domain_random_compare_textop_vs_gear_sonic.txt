@@ -1,0 +1,509 @@
+================================================================================
+TextOpTracker vs gear_sonic (SONIC) — PPO / Domain Random / 数据增强 对比
+================================================================================
+对比基准：
+  TextOp  → TextOpTracker/source/textop_tracker/.../config/g1/agents/rsl_rl_ppo_cfg.py
+            + tracking_env_cfg.py (EventCfg / CommandsCfg / ObservationsCfg)
+  SONIC   → GR00T-WholeBodyControl/gear_sonic/config/exp/manager/universal_token/
+            all_modes/sonic_g1_only_5point_ori.yaml
+            + defaults: algo/ppo_im_phc.yaml, manager_env/events/tracking/level0_4.yaml
+            + manager_env/commands/terms/motion.yaml
+
+生成时间：2026-05-25
+
+================================================================================
+一、PPO 训练参数对比
+================================================================================
+
+┌─────────────────────────────┬──────────────────────────┬──────────────────────────┐
+│ 参数                        │ TextOpTracker (G1)       │ gear_sonic (5point_ori)  │
+├─────────────────────────────┼──────────────────────────┼──────────────────────────┤
+│ 框架                        │ rsl_rl-modular-normed    │ 自研 TRL PPO (trl/)      │
+│ 配置入口                    │ G1FlatPPORunnerCfg       │ ppo_im_phc + exp yaml    │
+│                             │ G1FlatPPOModNormRunnerCfg│ TRLAuxLossPPOTrainer     │
+├─────────────────────────────┼──────────────────────────┼──────────────────────────┤
+│ num_envs                    │ 4096 (TrackingEnvCfg)  │ 4096                     │
+│ num_steps_per_env           │ 24                       │ 24 (exp 覆盖 base 32)    │
+│ max_iterations              │ 100000                   │ 100000                   │
+│ save_interval               │ 500                      │ 500                      │
+│ num_learning_epochs         │ 5                        │ 5                        │
+│ num_mini_batches            │ 4                        │ 4                        │
+├─────────────────────────────┼──────────────────────────┼──────────────────────────┤
+│ clip_param                  │ 0.2                      │ 0.2                      │
+│ gamma                       │ 0.99                     │ 0.99                     │
+│ lam (GAE)                   │ 0.95                     │ 0.95                     │
+│ value_loss_coef             │ 1.0                      │ 1.0                      │
+│ use_clipped_value_loss      │ True                     │ True                     │
+├─────────────────────────────┼──────────────────────────┼──────────────────────────┤
+│ entropy_coef                │ 0.005                    │ 0.01                     │
+│ learning_rate               │ 1e-3 (actor=critic 共用) │ actor: 2e-5              │
+│                             │                          │ critic: 1e-3             │
+│ schedule                    │ adaptive                 │ adaptive                 │
+│ desired_kl                  │ 0.01                     │ 0.01                     │
+│ adaptive LR 范围            │ 1e-5 ~ 1e-2 (ppo.py)     │ 1e-5 ~ 2e-4 (yaml 显式)  │
+├─────────────────────────────┼──────────────────────────┼──────────────────────────┤
+│ max_grad_norm               │ 1.0                      │ 0.1 (exp 覆盖 base 1.0)  │
+│ init_noise_std              │ 1.0                      │ 0.05                     │
+│ std 上限/下限               │ 无 (无 clamp)            │ 有: use_clampped_std     │
+│                             │                          │ min=0.001, max=0.5       │
+│                             │                          │ (actor_critic_modules.py)│
+├─────────────────────────────┼──────────────────────────┼──────────────────────────┤
+│ 观测归一化                  │ empirical_normalization  │ actor running_mean_std:  │
+│                             │ = True (runner)          │ false (g1_only_mlp cfg)  │
+├─────────────────────────────┼──────────────────────────┼──────────────────────────┤
+│ Policy 结构                 │ MLP [512,256,128]        │ UniversalTokenModule     │
+│                             │ 或 ActorCriticMNMLP      │ (FSQ + G1 encoder/decoder│
+│                             │                          │ + aux loss)              │
+├─────────────────────────────┼──────────────────────────┼──────────────────────────┤
+│ PPO batch shuffle           │ rsl_rl 默认              │ ppo_shuffle_every_epoch  │
+│                             │                          │ = True                   │
+│ Advantage 归一化            │ rollout 级 (rsl_rl)      │ sync_advantage_          │
+│                             │                          │ normalization = True     │
+│                             │                          │ (多 GPU gather 后归一化) │
+├─────────────────────────────┼──────────────────────────┼──────────────────────────┤
+│ 额外训练 loss               │ 无                       │ aux_loss g1_recon        │
+│                             │                          │ coef = 0.01              │
+│ Symmetry 镜像增强 (PPO)     │ 无                       │ 代码支持，本 exp 未启用  │
+└─────────────────────────────┴──────────────────────────┴──────────────────────────┘
+
+【TextOp 关键差异摘要】
+  - 探索噪声初始值更大 (1.0 vs 0.05)，且无 std clamp，训练中 std 可无限增大
+  - 单一 learning_rate 1e-3，SONIC actor LR 低一个数量级 (2e-5)
+  - max_grad_norm 更松 (1.0 vs 0.1)
+  - entropy 系数更小 (0.005 vs 0.01)
+
+【SONIC sonic_g1_only_5point_ori 特有】
+  - std_clamp: [0.001, 0.5]，防止探索噪声爆炸
+  - Actor/Critic 分离学习率
+  - Universal Token + motion reconstruction auxiliary loss
+  - 历史观测长度 actor_prop_history_length = 10
+
+================================================================================
+二、Domain Randomization 对比
+================================================================================
+
+────────────────────────────────────────────────────────────────────────────────
+2.1 Event 系统（Isaac Lab EventTerm）
+────────────────────────────────────────────────────────────────────────────────
+
+两者均使用 Isaac Lab 事件系统，startup + interval 两类。
+
+┌──────────────────────────┬─────────────────────────┬─────────────────────────┐
+│ Event                    │ TextOp EventCfg         │ SONIC level0_4          │
+├──────────────────────────┼─────────────────────────┼─────────────────────────┤
+│ physics_material         │ startup, robot .*       │ 相同                    │
+│                          │ static_fric: 0.3~1.6    │ static_fric: 0.3~1.6    │
+│                          │ dynamic_fric: 0.3~1.2   │ dynamic_fric: 0.3~1.2   │
+│                          │ restitution: 0.0~0.5    │ restitution: 0.0~0.5    │
+│                          │ num_buckets: 64         │ num_buckets: 64         │
+├──────────────────────────┼─────────────────────────┼─────────────────────────┤
+│ add_joint_default_pos    │ startup, joints .*      │ 相同                    │
+│                          │ add uniform (-0.01,0.01)│ add uniform (-0.01,0.01)│
+├──────────────────────────┼─────────────────────────┼─────────────────────────┤
+│ base_com (torso_link)    │ startup                 │ 相同                    │
+│                          │ x: ±0.025               │ x: ±0.025               │
+│                          │ y: ±0.05                │ y: ±0.05                │
+│                          │ z: ±0.05                │ z: ±0.05                │
+├──────────────────────────┼─────────────────────────┼─────────────────────────┤
+│ push_robot               │ interval 1.0~3.0 s      │ interval 4.0~6.0 s      │
+│                          │ velocity_range 见下     │ velocity_range 相同     │
+├──────────────────────────┼─────────────────────────┼─────────────────────────┤
+│ randomize_rigid_body_mass│ 无                      │ startup                 │
+│                          │                         │ body: .*wrist_yaw.*|    │
+│                          │                         │       torso_link        │
+│                          │                         │ scale: 0.8 ~ 2.5        │
+└──────────────────────────┴─────────────────────────┴─────────────────────────┘
+
+push / reset velocity_range（两者数值相同）：
+  x,y: ±0.5 m/s
+  z:   ±0.2 m/s
+  roll,pitch: ±0.52 rad/s
+  yaw: ±0.78 rad/s
+
+────────────────────────────────────────────────────────────────────────────────
+2.2 Episode Reset 随机化（Motion Command _resample_command）
+────────────────────────────────────────────────────────────────────────────────
+
+两者 reset 时 root pose/velocity/joint 随机化范围一致（来自 motion.yaml / CommandsCfg）：
+
+  pose_range:
+    x,y: ±0.05 m
+    z:   ±0.01 m
+    roll,pitch: ±0.1 rad
+    yaw: ±0.2 rad
+
+  velocity_range: 同 push_robot 上表
+
+  joint_position_range: ±0.1 rad
+
+  joint_velocity_range:
+    TextOp: 未单独配置（用 velocity_range 扰动 root ang_vel）
+    SONIC: 默认 [-0, 0]（关闭 joint vel 扰动）
+
+────────────────────────────────────────────────────────────────────────────────
+2.3 场景 / 物理差异
+────────────────────────────────────────────────────────────────────────────────
+
+  TextOp:
+    - terrain_type: plane（平地）
+    - 无 mass randomization event
+    - random_static_prob: 默认 -1.0（关闭；可将 motion 变为 static 增广）
+    - DelayedImplicitActuator 代码存在，G1 配置未启用 delay
+
+  SONIC (本 exp):
+    - terrain_type: trimesh（非平面地形）
+    - wrist + torso 质量 scale 0.8~2.5
+    - push 频率更低（4~6s vs 1~3s）
+    - adaptive_sampling: adp_samp_failure_rate_max_over_mean = 20
+
+================================================================================
+三、数据增强 / Observation Noise 对比
+================================================================================
+
+────────────────────────────────────────────────────────────────────────────────
+3.1 Policy 观测噪声（enable_corruption = True）
+────────────────────────────────────────────────────────────────────────────────
+
+TextOp (ProjGrav / 基础 PolicyCfg 典型值):
+  motion_anchor_pos_b:  Unoise ±0.25
+  motion_anchor_ori_b:  Unoise ±0.05
+  projected_gravity:    Unoise ±0.07  (ProjGrav 版)
+  base_lin_vel:         Unoise ±0.5
+  base_ang_vel:         Unoise ±0.2
+  joint_pos:            Unoise ±0.01
+  joint_vel:            Unoise ±0.5
+  command (ProjGrav):   Gaussian std=0.0（无噪声）
+  历史长度:             无（单帧）
+
+SONIC (local_dir_hist_anchor + unitoken):
+  gravity_dir:          Unoise ±0.05,  history=10
+  base_ang_vel:         Unoise ±0.2,   history=10
+  joint_pos:            Unoise ±0.01,  history=10
+  joint_vel:            Unoise ±0.5,   history=10
+  actions:              history=10（无噪声）
+  robot_anchor_pose_w:  history=10（无噪声项）
+  motion_anchor_ori_b:  Unoise ±0.05（tokenizer 路径）
+  注: SONIC policy 不含 base_lin_vel；用 gravity_dir + anchor pose 替代
+
+────────────────────────────────────────────────────────────────────────────────
+3.2 Motion / Reference 数据增强（SONIC 独有，TextOp 无）
+────────────────────────────────────────────────────────────────────────────────
+
+sonic_g1_only_5point_ori.yaml 中启用：
+
+  cat_upper_body_poses: true
+    - 概率 cat_upper_body_poses_prob: 0.5
+    - 对匹配 upper_body_augment_prefixes 的 motion，随机替换 upper body pose
+    - prefixes: 2025, sonic_walking, sonic_running, balance 等
+
+  freeze_frame_aug: true
+    - 默认 freeze_frame_aug_prob: 0.1（commands.py 默认）
+    - 训练时将 reference 某一帧「冻结」若干步，模拟停顿/卡顿
+
+  randomize_wrist_poses: false（本 exp 未开）
+    - 若开启: prob=0.3, std=0.1 rad 高斯噪声
+
+  num_future_frames: 10（TextOp 默认 future_steps=5；TransformerVAE 任务可改为 10）
+
+  dt_future_ref_frames: 0.1
+
+TextOp 仅有：
+  random_static_prob: 默认关闭（-1.0）
+    - 开启后会平移 motion 使 anchor 静止，用于 static 场景增广
+
+────────────────────────────────────────────────────────────────────────────────
+3.3 PPO 训练阶段数据增强
+────────────────────────────────────────────────────────────────────────────────
+
+  TextOp (rsl_rl):
+    - 无 symmetry / mirror augmentation
+    - 无 rollout batch 级 obs 翻转
+    - empirical_normalization 在线更新 obs 统计量
+
+  SONIC (trl PPO):
+    - 代码支持 use_symmetry 左右镜像（obs + action flip + consistency loss）
+    - 本 exp yaml 未配置 use_symmetry → 默认关闭
+    - ppo_shuffle_every_epoch: 每 epoch 重 shuffle mini-batch
+    - sync_advantage_normalization: 分布式 advantage 同步归一化
+    - aux loss: G1 motion token reconstruction (coef 0.01)
+
+================================================================================
+四、Reward / Tracking 目标差异（简要，影响训练信号）
+================================================================================
+
+  TextOp RewardsCfg（标准 tracking）:
+    - 14 body anchor-aligned tracking (motion_body_pos/ori/vel)
+    - anchor global pos/ori
+    - action_rate, joint_limit, undesired_contacts
+    - feet_slide, soft_landing, overspeed, overeffort（带 pfail 门控）
+
+  SONIC base_5point_local_endpoint_ori_feet_acc:
+    - 标准 tracking 项 + anti_shake_ang_vel
+    - 5-point local position (pelvis + 2 wrist + 2 ankle, 带 offset)
+    - endpoint local orientation tracking
+    - feet_acc 惩罚 (weight -2.5e-6，exp 中覆盖)
+    - reward anchor body: pelvis（TextOp G1 anchor: torso_link）
+
+  5-point reward body offsets（SONIC）:
+    wrist: [0.18, ±0.025, 0.0]（虚拟 tracking 点）
+
+================================================================================
+五、关键结论
+================================================================================
+
+【PPO】
+  1. 核心 PPO 超参（clip/gamma/lam/epochs/mini_batches/steps）两者接近。
+  2. 最大差异：SONIC 有 std clamp [0.001, 0.5]、更低 init_noise_std (0.05)、
+     分离 actor/critic LR、更紧 max_grad_norm (0.1)；TextOp 均无 std 上限。
+  3. SONIC 使用 Token + aux reconstruction loss；TextOp 纯 MLP/MNMLP tracking。
+
+【Domain Random】
+  1. 摩擦/关节零位/CoM/push 速度范围基本一致。
+  2. SONIC 额外：trimesh 地形、wrist+torso 质量随机、更稀疏 push (4~6s)。
+  3. Reset pose/velocity/joint 随机化范围两者相同。
+
+【数据增强】
+  1. 两者都有 policy obs 均匀噪声 + corruption。
+  2. SONIC 额外：10 帧 history、upper body pose 拼接增广、freeze frame；
+     TextOp 无 motion-level 增广（random_static 默认关）。
+  3. 两者本配置均未启用 PPO symmetry mirror。
+
+================================================================================
+六、主要代码/配置路径索引
+================================================================================
+
+TextOpTracker:
+  PPO:     .../config/g1/agents/rsl_rl_ppo_cfg.py
+  Events:  .../tasks/tracking/tracking_env_cfg.py → EventCfg
+  Command: .../tasks/tracking/mdp/commands_multi.py → _resample_command
+  PPO impl: deps/rsl_rl-modular-normed/rsl_rl/algorithms/ppo.py
+  Actor:   deps/rsl_rl-modular-normed/rsl_rl/modules/actor_critic.py
+
+gear_sonic:
+  Exp:     config/exp/.../sonic_g1_only_5point_ori.yaml
+  PPO:     config/algo/ppo_im_phc.yaml
+  Events:  config/manager_env/events/tracking/level0_4.yaml
+  Command: config/manager_env/commands/terms/motion.yaml
+  Motion aug: utils/motion_lib/motion_lib_base.py
+  Std clamp: trl/modules/actor_critic_modules.py → get_std
+  PPO trainer: trl/trainer/ppo_trainer.py
+
+================================================================================
+七、Adaptive Sampling 对比
+================================================================================
+
+对比基准：
+  TextOp  → commands_multi.py (MultiMotionLoader, 默认 enable=False)
+            commands.py (单 motion 文件, bin 级, 旧版)
+  SONIC   → motion_lib_base.py + commands.py (TrackingCommand)
+            motion.yaml + sonic_g1_only_5point_ori.yaml 覆盖项
+
+────────────────────────────────────────────────────────────────────────────────
+7.1 总览
+────────────────────────────────────────────────────────────────────────────────
+
+┌─────────────────────────┬──────────────────────────┬──────────────────────────┐
+│ 维度                    │ TextOpTracker            │ gear_sonic (SONIC)       │
+├─────────────────────────┼──────────────────────────┼──────────────────────────┤
+│ 默认是否启用            │ False                    │ True (motion.yaml)       │
+│ 实现位置                │ MotionCommand            │ MotionLib + TrackingCmd  │
+│ 采样粒度                │ Motion 级（整条 clip）   │ Bin 级（clip 内时间段）  │
+│ 是否同时采样起始帧      │ 否（motion 自适应，     │ 是（motion_id +          │
+│                         │  time 仍 uniform）       │  time_step 联合采样）    │
+│ 失败信号                │ episode terminate        │ reset_terminated         │
+│ 统计更新频率            │ 每 step (_update_command)│ 每 step (update_adapt.)  │
+│ 概率重算频率            │ 每 resample 即时         │ 周期性 sync + 重算       │
+│ 多 GPU 同步             │ 无                       │ 有 (gather + mean)       │
+│ Checkpoint 持久化       │ 无（仅 wandb dump pkl）  │ 有 (adp_samp stats)      │
+└─────────────────────────┴──────────────────────────┴──────────────────────────┘
+
+────────────────────────────────────────────────────────────────────────────────
+7.2 TextOpTracker — commands_multi.py（当前主路径）
+────────────────────────────────────────────────────────────────────────────────
+
+【开关与默认配置】MotionCommandCfg:
+  enable_adaptive_sampling: False        ← 默认关闭，走 uniform motion 采样
+  ads_type: "v1"                         ← v1 / v2 / v3 三种失败率公式
+  ads_stable_count: True                 ← 仅当该 motion 本 step 被尝试过才更新计数
+  adaptive_uniform_ratio: 0.1            ← 10% 均匀分布混合
+  adaptive_alpha: 0.001                 ← EMA 平滑系数（极小，变化很慢）
+  adaptive_beta: 0.5                     ← 失败率指数变换
+  adaptive_length_weighted: False        ← v1 可选：按 motion 长度加权
+
+【关闭时 (_uniform_sampling)】
+  motion_idx ~ Uniform(0, num_motion_files)
+
+【开启时 (_adaptive_sampling) 流程】
+
+  Step 1 — 统计本 batch reset 的成功/失败（按 motion_idx）:
+    episode_failed  = termination_manager.terminated
+    episode_success = ~episode_failed（含 motion 播完自然结束）
+    current_failed_motion_count[m]  += count
+    current_success_motion_count[m] += count
+
+  Step 2 — 计算每条 motion 的失败率 p_fail（三种 ads_type）:
+
+    v1: p_fail = failed / sum(failed)           # 全局失败占比
+        可选 × file_lengths 再归一化
+
+    v2: p_fail = failed / (failed + success)      # 每条 motion 自身 fail rate
+
+    v3: p_fail = failed / (failed + success)
+        p_fail_sample = 1 - (1 - p_fail)^beta   # 强调高失败率尾部
+
+  Step 3 — 采样概率:
+    p_fail_sample = p_fail ^ beta（v1/v2）或 v3 公式
+    prob = p_fail_sample * (1 - uniform_ratio) + uniform_ratio / num_motion
+
+  Step 4 — 采样 motion:
+    motion_idx ~ Multinomial(prob)
+
+  Step 5 — 起始帧（与 adaptive 无关）:
+    time_steps ~ Uniform(0, motion_length)      ← 始终随机，不按失败段调整
+
+  Step 6 — EMA 更新全局计数（每 step _update_command）:
+    failed_motion_count  ← alpha * current_failed + (1-alpha) * failed_motion_count
+    success_motion_count ← 同理
+    pfail_total = failed_total / (failed_total + success_total)  → 用于 reward 门控
+
+【旧版 commands.py（单 motion 文件）— bin 级，与 multi 不同】
+  - 将一条 motion 均分为 bin_count 段
+  - 失败时记录 fail_bin，用 1D conv + exponential kernel 平滑相邻 bin
+  - 采样 bin → 映射到 time_steps
+  - 更接近 SONIC 的「时间段级」思路，但仅针对单 clip，multi 路径未使用
+
+【TextOp 特点 / 局限】
+  + 实现简单，按 motion 文件粒度调 curriculum
+  + v2/v3 用 success+fail 比，比 v1 更合理
+  + pfail_total 与 reward pfail 门控联动
+  - 默认关闭，多数实验可能是 uniform
+  - 不调整 clip 内起始时间 → 难段/易段 within motion 不区分
+  - 无 failure rate 上界 clip，难 motion 可能 dominate
+  - 无 multi-GPU 统计同步
+
+────────────────────────────────────────────────────────────────────────────────
+7.3 gear_sonic — motion_lib_base.py（SONIC 主路径）
+────────────────────────────────────────────────────────────────────────────────
+
+【开关与默认配置】motion.yaml → adaptive_sampling:
+  enable: true
+  bin_size: 50                           ← 每 50 帧一个 bin
+  sequence_length_agnostic: true         ← 按 motion 内 bin 数归一化权重
+  init_num_failures: 1                   ← 初始 failure/ep 计数（避免除零）
+  uniform_sampling_rate: 0.1             ← 10% 均匀（同 TextOp uniform_ratio）
+  adp_samp_failure_rate_max_over_mean: 50.0   ← 默认 clip 上界
+  pre_failure_sample_window: 200          ← 采样时向前偏移，提前练习难段
+  use_failure_rate_decay: false          ← 可选：失败率沿 bin 反向传播
+
+  sonic_g1_only_5point_ori.yaml 覆盖:
+    adp_samp_failure_rate_max_over_mean: 20   ← 更紧的 clip（比默认 50 保守）
+
+【数据结构 init_adaptive_sampling】
+  - 对数据集中 ALL unique motions 预计算 bins
+  - 每条 motion 按 bin_size 切分 → adp_samp_bins[motion_id, start, end]
+  - adp_samp_frame_to_bin: 每帧 → bin_id（全局稳定索引）
+  - adp_samp_bin_weights: 长 bin 权重 × sequence_length_agnostic 归一化
+
+【每 step 统计 update_adaptive_sampling】
+  - 输入: failure=reset_terminated, motion_ids, motion_time_steps
+  - 定位 bin: frame = length_start[motion] + time_step → bin_id
+  - adp_samp_num_episodes[bin] += count / bin_length
+  - 若 failure: adp_samp_num_failures[bin] += count × multiplier
+
+【周期性重算 sync_and_compute_adaptive_sampling】
+  - 多 GPU: gather episodes/failures → mean
+  - failure_rate = failures / episodes
+  - 可选 decay: 沿 bin 序列反向传播失败率（类似 GAE）
+  - update_adaptive_sampling_probabilities():
+
+      active_rate_clipped = clip(rate, 0, mean(rate) × max_over_mean)
+      prob_fail = active_rate_clipped / sum
+      prob = prob_fail × (1 - uniform_rate) + uniform × uniform_rate
+      prob × bin_weights → 归一化
+
+  - 可选 max_prob_per_bin / max_prob_per_motion 防 catastrophic forgetting
+    （默认 yaml 未配置 → 仅用 failure rate clip）
+
+【采样 sample_motion_ids_and_time_steps(n)】
+  1. bin_id ~ Multinomial(adp_sampling_active_prob)
+  2. time_step ~ Uniform(bin_start, bin_end)   ← bin 内随机帧
+  3. 若 pre_failure_sample_window > 0:
+       time_step -= randint(0, window)        ← 提前 200 帧起步
+  4. 返回 (motion_id, time_step)
+
+【与 PPO 训练循环集成】
+  - ppo_trainer.sync_adaptive_sampling(): 每 sync_adaptive_sampling_all_gpus_freq
+    步（默认 200）跨 GPU 同步并重算概率
+  - im_resample_callback: 可触发 env.resample_motion() 刷新 loaded batch
+
+【SONIC 特点】
+  + Bin 级 curriculum：同一 motion 内难段/易段分开加权
+  + motion + 起始帧联合自适应
+  + failure rate clip (max_over_mean) 防止单一难 clip 垄断
+  + pre_failure_window 让 policy 在失败前先练习
+  + 多 GPU 同步 + checkpoint 恢复统计
+  - 实现复杂，依赖全局 bin 索引与 motion lib 预计算
+  - bin_size / window 等超参敏感
+
+────────────────────────────────────────────────────────────────────────────────
+7.4 核心公式对比
+────────────────────────────────────────────────────────────────────────────────
+
+TextOp (v2, 默认推荐类型):
+  p_fail[m] = failed[m] / (failed[m] + success[m] + eps)
+  prob[m]   = normalize(p_fail[m]^β) × (1-ε) + ε/M
+  time      ~ Uniform(0, len[m])                    # 与 prob 无关
+
+SONIC:
+  rate[b]   = failures[b] / episodes[b]
+  rate'[b]  = clip(rate[b], 0, mean(rate) × K)     # K=20 (5point_ori)
+  prob[b]   = normalize(rate'[b]) × (1-ε) + ε/B_active
+  prob[b]  × bin_weight[b]
+  (motion, t) ~ prob[b] → bin b → uniform t in [start, end) - offset
+
+────────────────────────────────────────────────────────────────────────────────
+7.5 配置参数对照表
+────────────────────────────────────────────────────────────────────────────────
+
+┌──────────────────────────┬─────────────────────┬─────────────────────────┐
+│ 含义                     │ TextOp              │ SONIC                   │
+├──────────────────────────┼─────────────────────┼─────────────────────────┤
+│ 启用                     │ enable_adaptive_    │ adaptive_sampling.      │
+│                          │ sampling (False)    │ enable (True)           │
+│ 均匀混合比例             │ adaptive_uniform_   │ uniform_sampling_rate   │
+│                          │ ratio = 0.1         │ = 0.1                   │
+│ 失败率指数               │ adaptive_beta=0.5   │ （无，用 clip 代替）    │
+│ 计数 EMA                 │ adaptive_alpha=     │ 无 EMA，直接累积        │
+│                          │ 0.001               │ episodes/failures       │
+│ 失败率上界               │ 无                  │ mean × max_over_mean    │
+│                          │                     │ (20 或 50)              │
+│ 时间粒度                 │ motion 级           │ bin_size=50 帧          │
+│ 起始帧策略               │ uniform             │ bin 内 uniform +        │
+│                          │                     │ pre_window=200          │
+│ 多 GPU                   │ 无                  │ gather + mean           │
+│ 与 reward 联动           │ pfail_total 门控    │ 无直接 pfail 门控       │
+└──────────────────────────┴─────────────────────┴─────────────────────────┘
+
+────────────────────────────────────────────────────────────────────────────────
+7.6 关键结论
+────────────────────────────────────────────────────────────────────────────────
+
+1. 粒度不同：TextOp 选「哪条 motion」；SONIC 选「哪条 motion 的哪一段」。
+2. TextOp 默认关闭 adaptive；SONIC 默认开启且是训练核心机制之一。
+3. SONIC 有 failure rate 上界 clip + pre-failure window，curriculum 更细、更稳。
+4. TextOp 的 pfail_total 与 reward/termination 门控绑定，adaptive 统计有下游用途；
+   SONIC adaptive 主要服务 motion 采样，与 reward 解耦。
+5. 若要把 TextOp 对齐 SONIC：需在 commands_multi 引入 bin 级统计、联合采样
+   time_steps，并加 failure rate clip；或启用 SONIC 式 motion_lib 架构。
+
+【代码路径】
+  TextOp:  .../mdp/commands_multi.py → _adaptive_sampling, _uniform_sampling
+           .../mdp/commands.py → bin 级旧实现
+           .../utils/my_on_policy_runner.py → checkpoint adpsam dump
+
+  SONIC:   .../utils/motion_lib/motion_lib_base.py → init/update/sample
+           .../envs/manager_env/mdp/commands.py → _update_command 调用
+           .../trl/trainer/ppo_trainer.py → sync_adaptive_sampling
+           config/manager_env/commands/terms/motion.yaml
+
+================================================================================
