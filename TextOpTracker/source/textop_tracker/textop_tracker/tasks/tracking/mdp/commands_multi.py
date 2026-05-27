@@ -350,6 +350,8 @@ class MotionCommand(CommandTerm):
                                                   device=self.device)
         self.metrics["sampling_top1_prob"] = torch.zeros(self.num_envs,
                                                          device=self.device)
+        self.metrics["freeze_frame_aug_ratio"] = torch.zeros(
+            self.num_envs, device=self.device)
         # self.metrics["sampling_top1_bin"] = torch.zeros(self.num_envs, device=self.device)
 
     def _init_buffers(self):
@@ -433,6 +435,38 @@ class MotionCommand(CommandTerm):
             if self.cfg.motion_transformer_vae_enabled:
                 self.motion_transformer_vae_latent_buffer[env_id] = motion_data[
                     "motion_transformer_vae_latent"]
+
+        self.metrics["freeze_frame_aug_ratio"][env_ids] = 0.0
+        if self.cfg.freeze_frame_aug and self.cfg.freeze_frame_aug_prob > 0:
+            freeze_mask = torch.rand(
+                len(env_ids), device=self.device) < self.cfg.freeze_frame_aug_prob
+            if freeze_mask.any():
+                freeze_env_ids = env_ids[freeze_mask]
+                freeze_indices = (
+                    torch.rand(len(freeze_env_ids), device=self.device) *
+                    self.buffer_length).long()
+                self.metrics["freeze_frame_aug_ratio"][freeze_env_ids] = 1.0
+
+                for env_id, freeze_idx in zip(freeze_env_ids, freeze_indices):
+                    idx = int(freeze_idx.item())
+                    self.joint_pos_buffer[env_id, idx:] = self.joint_pos_buffer[
+                        env_id, idx:idx + 1].clone()
+                    self.joint_vel_buffer[env_id, idx:] = 0.0
+                    self.body_pos_w_buffer[env_id, idx:] = self.body_pos_w_buffer[
+                        env_id, idx:idx + 1].clone()
+                    self.body_quat_w_buffer[env_id, idx:] = self.body_quat_w_buffer[
+                        env_id, idx:idx + 1].clone()
+                    self.body_lin_vel_w_buffer[env_id, idx:] = 0.0
+                    self.body_ang_vel_w_buffer[env_id, idx:] = 0.0
+
+                    if self.cfg.motion_ae_enabled:
+                        self.motion_ae_latent_buffer[env_id, idx:] = (
+                            self.motion_ae_latent_buffer[env_id, idx:idx + 1].clone()
+                        )
+                    if self.cfg.motion_transformer_vae_enabled:
+                        self.motion_transformer_vae_latent_buffer[env_id, idx:] = (
+                            self.motion_transformer_vae_latent_buffer[env_id, idx:idx + 1].clone()
+                        )
 
         if self.cfg.random_static_prob > 0:
             # Usage: p = random_static_prob
@@ -1153,6 +1187,10 @@ class MotionCommandCfg(CommandTermCfg):
 
     # Future steps configuration for N-step lookahead
     future_steps: int = 1
+
+    # Reference motion augmentation.
+    freeze_frame_aug: bool = False
+    freeze_frame_aug_prob: float = 0.1
 
     # MotionAE latent command configuration.
     motion_ae_enabled: bool = False

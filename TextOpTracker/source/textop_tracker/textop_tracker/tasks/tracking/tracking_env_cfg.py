@@ -89,6 +89,7 @@ class CommandsCfg:
 
     motion = mdp.MotionCommandCfg(
         future_steps=5,  # Future N-step lookahead
+        freeze_frame_aug=True,
         asset_name="robot",
         resampling_time_range=(1.0e9, 1.0e9),
         debug_vis=True,
@@ -490,6 +491,16 @@ class EventCfg:
                 "y": (-0.05, 0.05),
                 "z": (-0.05, 0.05)
             },
+        },
+    )
+
+    randomize_rigid_body_mass = EventTerm(
+        func=mdp.randomize_rigid_body_mass,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=".*wrist_yaw.*|torso_link"),
+            "mass_distribution_params": (0.8, 2.5),
+            "operation": "scale",
         },
     )
 
