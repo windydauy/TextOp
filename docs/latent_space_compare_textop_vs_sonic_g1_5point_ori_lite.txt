@@ -1,0 +1,281 @@
+================================================================================
+Latent Space 构造对比：TextOpTracker vs gear_sonic
+================================================================================
+对比基准：
+  TextOp  → MotionCommand + MotionTransformerVAE/MotionAE（commands_multi.py）
+            G1FlatProjGravAnchorEEObsTransformerVAEEnvCfg（future_steps=10, z_c）
+  SONIC   → sonic_g1_only_5point_ori_lite.yaml
+            UniversalTokenModule + g1_mf_mlp_lite encoder + FSQ + g1_dyn/g1_kin decoders
+
+生成时间：2026-05-25
+
+================================================================================
+一、架构总览（最重要差异）
+================================================================================
+
+┌─────────────────────────┬──────────────────────────┬──────────────────────────┐
+│ 维度                    │ TextOpTracker            │ gear_sonic (5point lite) │
+├─────────────────────────┼──────────────────────────┼──────────────────────────┤
+│ Latent 何时算           │ 离线/加载时预计算        │ 每个 PPO forward 在线算  │
+│                         │（MultiMotionLoader）     │（Actor backbone 内）      │
+├─────────────────────────┼──────────────────────────┼──────────────────────────┤
+│ Latent 存在哪           │ motion_*_latent_buffer   │ 无持久 buffer；每步      │
+│                         │ → policy obs `command`   │ encode→FSQ→decode 瞬态   │
+├─────────────────────────┼──────────────────────────┼──────────────────────────┤
+│ Policy 输入 command     │ 扁平连续向量（如 128 维）│ 原始 reference 特征      │
+│                         │                          │ + proprio → 内部 token   │
+├─────────────────────────┼──────────────────────────┼──────────────────────────┤
+│ 量化                    │ Transformer VAE 连续 z_c │ FSQ（32 维 × 2 token）   │
+│                         │ 或 MotionAE IFsq        │ vector_quantize_pytorch  │
+├─────────────────────────┼──────────────────────────┼──────────────────────────┤
+│ 时间压缩                │ VAE：10 帧→1 个 latent   │ Encoder MLP：10 帧→2 token│
+├─────────────────────────┼──────────────────────────┼──────────────────────────┤
+│ 与 Actor 关系           │ Latent 作 obs，Actor MLP │ Latent 在 Actor 骨干内   │
+│                         │ 与 motion 模型分离       │（UniversalTokenModule）  │
+└─────────────────────────┴──────────────────────────┴──────────────────────────┘
+
+一句话：
+  TextOp =「先用冻结的 Transformer VAE 把 motion 压成 128 维，policy 只读这个向量」
+  SONIC  =「policy 骨干里用 MLP 把 10 步 joint+anchor 特征压成 FSQ token，再解码成 action」
+
+================================================================================
+二、TextOpTracker — Latent 构造流程
+================================================================================
+
+【模式 A】Transformer VAE（G1 TransformerVAE / EEObs 任务默认）
+
+配置（commands_multi.py / flat_env_cfg.py）：
+  motion_transformer_vae_enabled = True
+  motion_transformer_vae_latent_mode = "z_c"   # 或 "mu"
+  future_steps = 10                          # 必须 = VAE window_size
+
+Step 1 — 从 npz 构建每帧特征（motion_ae/feature_builder.py）
+  输入：joint_pos, joint_vel, pelvis quat/vel（anchor 系）
+  每帧维度 D ≈ 2×29 + 6 + 3 + 3 = 70（G1 29 DoF 时）
+
+Step 2 — 归一化 + 构造 future window
+  normalized = (features - mean) / std
+  windows[t] = features[t : t+10]   # clamp 到末帧，与 SONIC num_future=10 类似
+
+Step 3 — 冻结 Transformer VAE 编码（motion_transformer_vae_latent.py）
+  model.encode(batch, sample=False)
+  latent_mode="z_c" → 取 z_c
+  latent_mode="mu"  → 取 mu
+  输出形状：[T, latent_size × latent_dim]
+    典型配置 latent_dim: [1, 128] → flat_latent_dim = 128
+
+Step 4 — 写入 MultiMotionLoader buffer
+  motion_transformer_vae_latent_buffer[env, t] = latent[t]
+  freeze_frame_aug 时 idx 之后 latent 也复制冻结
+
+Step 5 — Policy 观测
+  ObsTerm: generated_commands → command.command
+           = motion_transformer_vae_latent（当前 time_steps 对应行）
+  另有多路 motion_anchor / EE future obs（与 latent 并行，非 SONIC tokenizer）
+
+【模式 B】Motion AE（可选，与 VAE 互斥）
+  motion_ae_enabled = True
+  同样 window=10，IFSQ 在 AE 内部
+  latent 每帧维度 = cfg.model.latent_dim（连续）
+  command = motion_ae_latent
+
+【模式 C】无 Latent（DirectRefMotion）
+  motion_transformer_vae_enabled = False
+  command = concat(joint_pos, joint_vel) 当前帧
+  维度 = 2 × num_dof（如 58）
+
+【Policy 侧】
+  ActorCritic / ActorCriticMNMLP：标准 MLP
+  不把 reference 再编码；直接 concat(obs, command_latent)
+
+================================================================================
+三、gear_sonic (sonic_g1_only_5point_ori_lite) — Latent / Token 构造流程
+================================================================================
+
+【观测分组】
+
+1) policy / actor_obs（local_dir_hist_anchor，history=10）
+   gravity_dir, base_ang_vel, joint_pos, joint_vel, actions,
+   robot_anchor_pose_w
+   → 作为 proprioception，送入 decoder，不直接构成 token
+
+2) tokenizer（unitoken_g1_only_5point_ori，不 flatten）
+   encoder_index
+   command_multi_future_nonflat      # 10 × (29+29) = 10×58
+   motion_anchor_ori_b_mf_nonflat    # 10 × 6（ref vs robot 根姿态差，body 系）
+   motion_anchor_pose_w_mf           # 供 g1_dyn decoder 条件
+   endpoint_pose_root_local_mf       # 5-point EE，供 g1_dyn decoder 条件
+
+【Tokenizer 特征含义】
+
+command_multi_future_nonflat:
+  func: command_multi_future(non_flatten=True)
+  = 未来 10 帧 reference joint_pos + joint_vel（IsaacLab 关节顺序）
+  shape: (num_envs, 10, 58)  # 29 DoF G1
+
+motion_anchor_ori_b_mf_nonflat:
+  = 未来 10 帧 reference 与 robot 根的旋转差（6D），robot 全姿态归一化
+  shape: (num_envs, 10, 6)
+
+【UniversalTokenModule 流水线】（Actor backbone）
+
+配置（g1_only_mlp_v1_5point_ori_lite.yaml）：
+  num_future_frames: 10
+  max_num_tokens: 2
+  num_fsq_levels: 32
+  fsq_level_list: 32
+  token_dim = 32, token_total_dim = 64
+  encoder_sample_probs: {g1: 1.0}
+
+Step 1 — Encoder `g1`（g1_mf_mlp_lite.yaml）
+  输入 concat:
+    command_multi_future_nonflat  → (B, 10, 58)
+    motion_anchor_ori_b_mf_nonflat → (B, 10, 6)
+  MLP: hidden [1024, 512, 256, 256]
+  时间维: num_input_temporal_dims=10 → num_output_temporal_dims=2
+  输出 pre-quantization latent: (B, 2, 32)  # 2 个 token，每 token 32 维
+
+  （full 版 g1_mf_mlp 首层 2048，lite 版 1024，结构相同）
+
+Step 2 — FSQ 量化（config/quantizers/fsq.yaml）
+  _target_: vector_quantize_pytorch.FSQ
+  levels = [32] × 32  # 每维 32-level 有限标量量化
+  encoded_tokens: 离散化后的 (B, 2, 32)
+
+Step 3 — Decoder `g1_dyn`（训练时出 action）
+  输入:
+    token_flattened (64)
+    proprioception (actor_obs 拼接)
+    motion_anchor_pose_w_mf
+    endpoint_pose_root_local_mf
+  MLP lite: [1024, 1024, 512, 512, 256, 256]
+  输出: action（关节目标）
+
+Step 4 — Decoder `g1_kin`（仅 aux loss，训练时重建运动）
+  输入: token (B, 2, 32)
+  输出: 重建 command_multi_future_nonflat + motion_anchor_ori_b_mf_nonflat
+  aux_loss g1_recon coef = 0.01
+
+【与 PPO 的关系】
+  每个 rollout step：env 提供 tokenizer 原始特征 → Actor.forward() 内部
+  encode → FSQ → g1_dyn.decode → action_mean
+  Latent/token 不单独存 env buffer，不进入 generated_commands 式 obs
+
+================================================================================
+四、维度对照表
+================================================================================
+
+┌────────────────────────────┬─────────────────┬─────────────────────────┐
+│ 项目                       │ TextOp (TVAE)   │ SONIC (lite)            │
+├────────────────────────────┼─────────────────┼─────────────────────────┤
+│ Reference 时间窗           │ 10 帧           │ 10 帧                   │
+│ 编码器输入（每帧/每窗）    │ ~70 维特征      │ 58+6 per frame          │
+│ 压缩后 command/token       │ 128 连续        │ 2×32=64（FSQ 离散）     │
+│ 量化方式                   │ VAE 潜变量 z_c  │ FSQ level=32            │
+│ Policy 看到的「命令」      │ 128-d 向量      │ 无；看原始 future joint │
+│                            │                 │ + 内部 token            │
+│ 重建监督                   │ 无（VAE 预训练）│ g1_kin aux recon 0.01   │
+│ Encoder 是否可训练         │ 冻结（adapter） │ 与 PPO 一起训练         │
+└────────────────────────────┴─────────────────┴─────────────────────────┘
+
+================================================================================
+五、数据流对比图（文字）
+================================================================================
+
+TextOp (TransformerVAE enabled):
+
+  motion.npz
+    → build_features (70-D/frame)
+    → normalize
+    → window [t:t+10]
+    → frozen TransformerVAE.encode → z_c [128]
+    → buffer[env, t]
+    → obs「command」= latent[t]
+    → Actor MLP(obs) → action
+
+SONIC (5point_ori_lite):
+
+  motion lib / TrackingCommand
+    → tokenizer obs: future joint(10×58) + anchor_ori_diff(10×6)
+         + anchor_pose_mf + endpoint_5pt（decoder 用）
+    → Actor.UniversalTokenModule.forward:
+         encoder MLP → latent (2×32)
+         → FSQ → tokens
+         → g1_dyn(token + proprio + cond) → action
+    （训练时 g1_kin(token) ≈ 重建 joint+ori，aux loss）
+
+================================================================================
+六、lite 与 full 5point_ori 的差异（仅结构规模）
+================================================================================
+
+  sonic_g1_only_5point_ori_lite.yaml 相对 g1_only_mlp_v1_5point_ori.yaml：
+  - encoder g1: hidden [1024,512,256,256] vs [2048,1024,512,512]
+  - decoder g1_dyn lite vs full 更大 MLP 规模不同
+  - latent 构造逻辑相同：同一 tokenizer 项、同一 FSQ、同一 max_num_tokens=2
+
+  lite exp 还覆盖：
+  - rewards: base_anchor_pose_local_endpoint_ori_feet_acc（anchor pose 系 reward）
+  - upper_body_augment_prefixes 注释为空（数据增广范围更窄）
+
+================================================================================
+七、与「五点点位」的关系
+================================================================================
+
+SONIC 5-point：
+  reward/obs 显式用 pelvis + 双腕 + 双踝（带 wrist offset）
+  endpoint_pose_root_local_mf 进入 g1_dyn decoder 条件
+  token 编码仍主要用 joint future + anchor ori diff（58+6），不是 5-point 直接进 encoder
+
+TextOp EEObs：
+  policy obs 有 motion_ee_pos_b_future / ori（EE 未来目标）
+  command latent 仍是 Transformer VAE 对全身 npz 特征的压缩
+  EE 与 latent 并行，不混入 VAE 输入（除非改 feature_builder）
+
+================================================================================
+八、关键结论与迁移建议
+================================================================================
+
+1. 语义不同
+   - TextOp latent = 离线运动先验（VAE），表示「整段未来动作的压缩码」
+   - SONIC token = 在线 ATM 瓶颈，表示「当前时刻可执行的离散运动原语」
+
+2. 训练耦合不同
+   - TextOp：VAE 与 RL 解耦；换 latent 需重导 npz 或重跑 adapter
+   - SONIC：encoder/FSQ/decoder 端到端与 PPO 同训；tokenizer 特征直接来自 sim
+
+3. 时间对齐
+   - 两者都用 10 帧 future horizon
+   - TextOp 每帧一个 128-d latent（滑动窗口编码）
+   - SONIC 每 step 从当前 10 帧 obs 产生 2 个 token
+
+4. 若 TextOp 要对齐 SONIC
+   - 需在 Actor 内嵌 encode→quantize→decode，而非预计算 buffer
+   - 或保留预计算但改用 FSQ + 重建 aux loss 训练 policy 骨干
+
+5. 若 SONIC 要对齐 TextOp
+   - 可预计算 Transformer VAE latent 写入 motion lib
+   - policy obs 只读 latent，去掉在线 UniversalTokenModule
+
+================================================================================
+九、代码路径索引
+================================================================================
+
+TextOpTracker:
+  mdp/motion_transformer_vae_latent.py   — VAE 编码 adapter
+  mdp/motion_ae_latent.py                — MotionAE 编码 adapter
+  mdp/commands_multi.py                  — buffer, command property
+  motion_ae/feature_builder.py           — npz → 70-D 特征
+  config/g1/flat_env_cfg.py              — future_steps=10, VAE on
+
+gear_sonic:
+  config/exp/.../sonic_g1_only_5point_ori_lite.yaml
+  config/actor_critic/universal_token/g1_only_mlp_v1_5point_ori_lite.yaml
+  trl/modules/universal_token_modules.py — encode / FSQ / decode / forward
+  config/actor_critic/encoders/g1_mf_mlp_lite.yaml
+  config/actor_critic/decoders/g1_dyn_mlp_lite.yaml
+  config/actor_critic/decoders/g1_kin_mf_mlp_lite.yaml
+  config/manager_env/observations/tokenizer/unitoken_g1_only_5point_ori.yaml
+  envs/manager_env/mdp/commands.py         — command_multi_future 定义
+  envs/manager_env/mdp/observations.py     — motion_anchor_ori_b_mf 等
+
+================================================================================

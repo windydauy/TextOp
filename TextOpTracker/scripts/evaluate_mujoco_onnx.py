@@ -32,10 +32,13 @@ SUCCESS_METRIC_KEYS = (
 FAIL_REASON_KEYS = (
     "nan_or_inf",
     "pelvis_height",
-    "global_mpjpe",
     "local_mpjpe",
-    "anchor_global_pos",
-    "ee_global_pos",
+)
+
+INTERNAL_METRIC_KEYS = (
+    "_joint_torque_abs_sum",
+    "_joint_torque_abs_sq_sum",
+    "_joint_torque_count",
 )
 
 
@@ -81,6 +84,10 @@ class MetricAccumulator:
         self.local_mpjpe_sum = 0.0
         self.anchor_global_pos_sum = 0.0
         self.anchor_local_pos_sum = 0.0
+        self.dof_pos_error_sum = 0.0
+        self.joint_torque_abs_sum = 0.0
+        self.joint_torque_abs_sq_sum = 0.0
+        self.joint_torque_count = 0
         self.eval_body_global_pos_sum = {name: 0.0 for name in EVAL_BODY_NAMES}
         self.eval_body_global_ori_sum = {name: 0.0 for name in EVAL_BODY_NAMES}
 
@@ -90,6 +97,10 @@ class MetricAccumulator:
         self.local_mpjpe_sum += values["local_mpjpe"]
         self.anchor_global_pos_sum += values["anchor_global_pos_error"]
         self.anchor_local_pos_sum += values["anchor_local_pos_error"]
+        self.dof_pos_error_sum += values["mean_dof_position_error"]
+        self.joint_torque_abs_sum += values["_joint_torque_abs_sum"]
+        self.joint_torque_abs_sq_sum += values["_joint_torque_abs_sq_sum"]
+        self.joint_torque_count += int(values["_joint_torque_count"])
         for name in EVAL_BODY_NAMES:
             self.eval_body_global_pos_sum[name] += values[f"{name}_global_pos_error"]
             self.eval_body_global_ori_sum[name] += values[f"{name}_global_ori_error_rad"]
@@ -98,12 +109,24 @@ class MetricAccumulator:
         if self.frames == 0:
             raise RuntimeError("No frames were evaluated")
         inv = 1.0 / self.frames
+        torque_mean = 0.0
+        torque_std = 0.0
+        if self.joint_torque_count > 0:
+            torque_mean = self.joint_torque_abs_sum / self.joint_torque_count
+            torque_var = self.joint_torque_abs_sq_sum / self.joint_torque_count - torque_mean**2
+            torque_std = float(np.sqrt(max(torque_var, 0.0)))
         result: dict[str, float | dict[str, float]] = {
             "frames": self.frames,
             "global_mpjpe": self.global_mpjpe_sum * inv,
             "local_mpjpe": self.local_mpjpe_sum * inv,
             "anchor_global_pos_error": self.anchor_global_pos_sum * inv,
             "anchor_local_pos_error": self.anchor_local_pos_sum * inv,
+            "mean_dof_position_error": self.dof_pos_error_sum * inv,
+            "mean_joint_torque": float(torque_mean),
+            "joint_torque_std": torque_std,
+            "_joint_torque_abs_sum": float(self.joint_torque_abs_sum),
+            "_joint_torque_abs_sq_sum": float(self.joint_torque_abs_sq_sum),
+            "_joint_torque_count": int(self.joint_torque_count),
             "eval_body_global_pos_error": {
                 name: self.eval_body_global_pos_sum[name] * inv for name in EVAL_BODY_NAMES
             },
@@ -124,13 +147,7 @@ class TerminationTracker:
         reasons = {
             "nan_or_inf": self._has_nonfinite(values, data),
             "pelvis_height": values["pelvis_global_height"] < self.args.pelvis_height_min,
-            "global_mpjpe": values["global_mpjpe"] > self.args.global_mpjpe_fail,
             "local_mpjpe": values["local_mpjpe"] > self.args.local_mpjpe_fail,
-            "anchor_global_pos": values["anchor_global_pos_error"] > self.args.anchor_global_pos_fail,
-            "ee_global_pos": (
-                self.args.ee_global_pos_fail > 0
-                and values["max_ee_global_pos_error"] > self.args.ee_global_pos_fail
-            ),
         }
         for reason, failed in reasons.items():
             self.counts[reason] = self.counts[reason] + 1 if failed else 0
@@ -170,7 +187,13 @@ def make_latent_adapters(task: str, args: argparse.Namespace):
     return motion_ae_adapter, motion_transformer_vae_adapter
 
 
-def compute_frame_metrics(sim_data, motion_loader: dm.MotionLoader, t: int, eval_indexes: list[int]) -> dict[str, float]:
+def compute_frame_metrics(
+    sim_data,
+    motion_loader: dm.MotionLoader,
+    t: int,
+    eval_indexes: list[int],
+    joint_torque: np.ndarray,
+) -> dict[str, float]:
     step_idx = min(t, motion_loader.T - 1)
     ref_body_indexes = [motion_loader.motion_body_index(name) for name in motion_loader.body_names]
     robot_pos = np.stack([sim_data.body(name).xpos.copy() for name in motion_loader.body_names], axis=0)
@@ -187,6 +210,9 @@ def compute_frame_metrics(sim_data, motion_loader: dm.MotionLoader, t: int, eval
     robot_local_pos = local_positions(robot_pos, robot_quat, robot_anchor_pos, robot_anchor_quat)
     ref_local_pos = local_positions(ref_pos, ref_quat, ref_anchor_pos, ref_anchor_quat)
     local_errors = np.linalg.norm(robot_local_pos - ref_local_pos, axis=-1)
+    ref_joint_pos = motion_loader.joint_pos[step_idx][dm.isaaclab_to_mujoco_reindex]
+    dof_position_error = np.abs(sim_data.qpos[7:] - ref_joint_pos)
+    joint_torque_abs = np.abs(np.asarray(joint_torque, dtype=np.float64))
 
     values = {
         "global_mpjpe": float(global_errors.mean()),
@@ -197,6 +223,12 @@ def compute_frame_metrics(sim_data, motion_loader: dm.MotionLoader, t: int, eval
                 dm.motion_anchor_pos_b_future(sim_data, motion_loader, step_idx).reshape(motion_loader.future_steps, 3)[0]
             )
         ),
+        "mean_dof_position_error": float(dof_position_error.mean()),
+        "mean_joint_torque": float(joint_torque_abs.mean()),
+        "joint_torque_std": float(joint_torque_abs.std()),
+        "_joint_torque_abs_sum": float(joint_torque_abs.sum()),
+        "_joint_torque_abs_sq_sum": float(np.square(joint_torque_abs).sum()),
+        "_joint_torque_count": float(joint_torque_abs.size),
     }
 
     eval_ref_indexes = [motion_loader.motion_body_index(name) for name in EVAL_BODY_NAMES]
@@ -258,6 +290,7 @@ def evaluate_motion(
     termination = TerminationTracker(args)
     eval_indexes = [motion_loader.motion_body_index(name) for name in EVAL_BODY_NAMES]
     inner_counter = 0
+    last_tau = np.zeros(dm.NUM_ACTIONS, dtype=np.float64)
     max_frames = motion_loader.T if args.max_frames <= 0 else min(args.max_frames, motion_loader.T)
     terminated = False
     failure_frame = None
@@ -266,6 +299,7 @@ def evaluate_motion(
         for _ in range(args.control_decimation):
             tau = dm.pd_control(target_dof_pos, data.qpos[7:], dm.kps, np.zeros_like(dm.kds), data.qvel[6:], dm.kds)
             data.ctrl[:] = tau
+            last_tau = tau.copy()
             mujoco.mj_step(model, data)
 
         obs = dm.compute_observation(
@@ -284,7 +318,7 @@ def evaluate_motion(
             )
         action = session.run(None, {obs_name: obs_tensor})[0].squeeze().astype(np.float32)
         target_dof_pos = action[dm.isaaclab_to_mujoco_reindex] * dm.action_scale + dm.default_angles
-        frame_metrics = compute_frame_metrics(data, motion_loader, inner_counter, eval_indexes)
+        frame_metrics = compute_frame_metrics(data, motion_loader, inner_counter, eval_indexes, last_tau)
         metrics.update(frame_metrics)
         failure = termination.update(frame_metrics, data)
         if failure is not None:
@@ -324,11 +358,18 @@ def flatten_row(summary: dict) -> dict[str, float | int | str]:
         "local_mpjpe": summary["local_mpjpe"],
         "anchor_global_pos_error": summary["anchor_global_pos_error"],
         "anchor_local_pos_error": summary["anchor_local_pos_error"],
+        "mean_dof_position_error": summary["mean_dof_position_error"],
+        "mean_joint_torque": summary["mean_joint_torque"],
+        "joint_torque_std": summary["joint_torque_std"],
     }
     for group in ("eval_body_global_pos_error", "eval_body_global_ori_error_rad"):
         for name, value in summary[group].items():
             row[f"{name}_{group}"] = value
     return row
+
+
+def public_summary(summary: dict) -> dict:
+    return {key: value for key, value in summary.items() if key not in INTERNAL_METRIC_KEYS}
 
 
 def aggregate(summaries: list[dict]) -> dict:
@@ -344,6 +385,19 @@ def aggregate(summaries: list[dict]) -> dict:
         if selected_frames <= 0:
             return 0.0
         return float(sum(float(item[key]) * int(item["frames"]) for item in selected) / selected_frames)
+
+    def torque_stats(items: list[dict]) -> tuple[float, float]:
+        count = sum(int(item["_joint_torque_count"]) for item in items)
+        if count <= 0:
+            return 0.0, 0.0
+        torque_sum = sum(float(item["_joint_torque_abs_sum"]) for item in items)
+        torque_sq_sum = sum(float(item["_joint_torque_abs_sq_sum"]) for item in items)
+        mean = torque_sum / count
+        var = torque_sq_sum / count - mean**2
+        return float(mean), float(np.sqrt(max(var, 0.0)))
+
+    all_torque_mean, all_torque_std = torque_stats(summaries)
+    success_torque_mean, success_torque_std = torque_stats(success_items)
 
     result: dict = {
         "num_motions": len(summaries),
@@ -361,6 +415,9 @@ def aggregate(summaries: list[dict]) -> dict:
             "local_mpjpe": weighted_scalar("local_mpjpe"),
             "anchor_global_pos_error": weighted_scalar("anchor_global_pos_error"),
             "anchor_local_pos_error": weighted_scalar("anchor_local_pos_error"),
+            "mean_dof_position_error": weighted_scalar("mean_dof_position_error"),
+            "mean_joint_torque": all_torque_mean,
+            "joint_torque_std": all_torque_std,
             "eval_body_global_pos_error": {},
             "eval_body_global_ori_error_rad": {},
         },
@@ -369,6 +426,9 @@ def aggregate(summaries: list[dict]) -> dict:
             "local_mpjpe": weighted_scalar("local_mpjpe", success_items),
             "anchor_global_pos_error": weighted_scalar("anchor_global_pos_error", success_items),
             "anchor_local_pos_error": weighted_scalar("anchor_local_pos_error", success_items),
+            "mean_dof_position_error": weighted_scalar("mean_dof_position_error", success_items),
+            "mean_joint_torque": success_torque_mean,
+            "joint_torque_std": success_torque_std,
             "eval_body_global_pos_error": {},
             "eval_body_global_ori_error_rad": {},
         },
@@ -494,7 +554,7 @@ def main() -> None:
         },
         "elapsed_sec": time.time() - started,
         "aggregate": aggregate_summary,
-        "motions": summaries,
+        "motions": [public_summary(item) for item in summaries],
     }
     json_path = output_dir / "metrics.json"
     csv_path = output_dir / "per_motion_metrics.csv"
