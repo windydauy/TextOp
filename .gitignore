@@ -194,10 +194,12 @@ _build
 *.npz
 *.sh
 !scripts/train_direct_ref_motion_eeobs_g1_before_2023.sh
+!scripts/eval_transformer_vae_g1_all_npz_random_mujoco.sh
 kimomotion_dataset/*
 TextOp-Data/*
 artifacts/
 TextOpTracker/artifacts/*
+TextOpTracker/eval_mujoco_onnx_random/*
 TextOpTracker/logs/*
 TextOpTracker/outputs/*
 TextOpTracker/recordings/*

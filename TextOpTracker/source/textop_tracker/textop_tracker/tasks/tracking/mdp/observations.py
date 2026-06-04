@@ -159,12 +159,18 @@ def motion_body_ori_b(
 
 
 def motion_body_pos_b_future(
-    env: ManagerBasedEnv, command_name: str, body_names: list[str]
+    env: ManagerBasedEnv,
+    command_name: str,
+    body_names: list[str],
+    future_steps: int | None = None,
 ) -> torch.Tensor:
     """Future N-step reference body positions in robot anchor frame (same layout as ``motion_anchor_pos_b_future``)."""
     command: MotionCommand = env.command_manager.get_term(command_name)
     body_indexes = [command.cfg.body_names.index(n) for n in body_names]
     future_pos_w, future_quat_w = command.future_body_pos_quat_w(body_indexes)
+    if future_steps is not None:
+        future_pos_w = future_pos_w[:, :future_steps]
+        future_quat_w = future_quat_w[:, :future_steps]
     n_steps = future_pos_w.shape[1]
     n_bodies = future_pos_w.shape[2]
 
@@ -184,12 +190,18 @@ def motion_body_pos_b_future(
 
 
 def motion_body_ori_b_future(
-    env: ManagerBasedEnv, command_name: str, body_names: list[str]
+    env: ManagerBasedEnv,
+    command_name: str,
+    body_names: list[str],
+    future_steps: int | None = None,
 ) -> torch.Tensor:
     """Future N-step reference body orientations (6D) in robot anchor frame."""
     command: MotionCommand = env.command_manager.get_term(command_name)
     body_indexes = [command.cfg.body_names.index(n) for n in body_names]
     future_pos_w, future_quat_w = command.future_body_pos_quat_w(body_indexes)
+    if future_steps is not None:
+        future_pos_w = future_pos_w[:, :future_steps]
+        future_quat_w = future_quat_w[:, :future_steps]
     n_steps = future_pos_w.shape[1]
     n_bodies = future_pos_w.shape[2]
 
@@ -209,13 +221,20 @@ def motion_body_ori_b_future(
     return mat[..., :2].reshape(env.num_envs, -1)
 
 
-def motion_anchor_pos_b_future(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
+def motion_anchor_pos_b_future(
+    env: ManagerBasedEnv,
+    command_name: str,
+    future_steps: int | None = None,
+) -> torch.Tensor:
     """Future N-step motion anchor position in body frame, flattened to vector."""
     command: MotionCommand = env.command_manager.get_term(command_name)
 
     # Reshape future data: (num_envs, future_steps, 3) and (num_envs, future_steps, 4)
     future_anchor_pos_w = command.motion_anchor_pos.view(env.num_envs, -1, 3)
     future_anchor_quat_w = command.motion_anchor_quat.view(env.num_envs, -1, 4)
+    if future_steps is not None:
+        future_anchor_pos_w = future_anchor_pos_w[:, :future_steps]
+        future_anchor_quat_w = future_anchor_quat_w[:, :future_steps]
 
     # Expand robot anchor for broadcasting: (num_envs, future_steps, 3) and (num_envs, future_steps, 4)
     robot_anchor_pos_w_exp = command.robot_anchor_pos_w[:, None, :].expand(-1, future_anchor_pos_w.shape[1], -1)
@@ -231,13 +250,20 @@ def motion_anchor_pos_b_future(env: ManagerBasedEnv, command_name: str) -> torch
     return pos_b.view(env.num_envs, -1)
 
 
-def motion_anchor_ori_b_future(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
+def motion_anchor_ori_b_future(
+    env: ManagerBasedEnv,
+    command_name: str,
+    future_steps: int | None = None,
+) -> torch.Tensor:
     """Future N-step motion anchor orientation in body frame, flattened to vector."""
     command: MotionCommand = env.command_manager.get_term(command_name)
 
     # Reshape future data: (num_envs, future_steps, 3) and (num_envs, future_steps, 4)
     future_anchor_pos_w = command.motion_anchor_pos.view(env.num_envs, -1, 3)
     future_anchor_quat_w = command.motion_anchor_quat.view(env.num_envs, -1, 4)
+    if future_steps is not None:
+        future_anchor_pos_w = future_anchor_pos_w[:, :future_steps]
+        future_anchor_quat_w = future_anchor_quat_w[:, :future_steps]
 
     # Expand robot anchor for broadcasting: (num_envs, future_steps, 3) and (num_envs, future_steps, 4)
     robot_anchor_pos_w_exp = command.robot_anchor_pos_w[:, None, :].expand(-1, future_anchor_pos_w.shape[1], -1)

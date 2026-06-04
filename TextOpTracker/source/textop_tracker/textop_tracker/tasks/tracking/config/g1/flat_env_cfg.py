@@ -6,6 +6,7 @@ from textop_tracker.tasks.tracking.tracking_env_cfg import (
     NoisePrivObservationsCfg,
     PrivPrivObservationsCfg,
     ProjGravAnchorEEObsObservationsCfg,
+    ProjGravAnchorEEObsOneStepFutureObservationsCfg,
     ProjGravAnchorEEObsSplitBodyTransformerVAERewardsCfg,
     ProjGravAnchorEEObsTransformerVAERewardsCfg,
     ProjGravAnchorObsObservationsCfg,
@@ -194,7 +195,6 @@ class G1FlatProjGravAnchorEEObsTransformerVAESplitBodyRewardEnvCfg(G1FlatProjGra
     """TransformerVAE EEObs tracker with split non-EE and EE rewards."""
 
     rewards: ProjGravAnchorEEObsSplitBodyTransformerVAERewardsCfg = ProjGravAnchorEEObsSplitBodyTransformerVAERewardsCfg()
-    
 
 
 @configclass
@@ -204,6 +204,11 @@ class G1FlatProjGravAnchorEEObsDirectRefMotionEnvCfg(G1FlatProjGravAnchorEEObsTr
     def __post_init__(self):
         super().__post_init__()
         self.commands.motion.motion_transformer_vae_enabled = False
+
+
+@configclass
+class G1FlatProjGravAnchorEEObsOneStepTransformerVAEEnvCfg(G1FlatProjGravAnchorEEObsTransformerVAEEnvCfg):
+    observations: ProjGravAnchorEEObsOneStepFutureObservationsCfg = ProjGravAnchorEEObsOneStepFutureObservationsCfg()
 
 
 @configclass

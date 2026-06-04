@@ -367,6 +367,56 @@ class ProjGravAnchorEEObsObservationsCfg(ProjGravAnchorObsObservationsCfg):
 
 
 @configclass
+class ProjGravAnchorEEObsOneStepFutureObservationsCfg(ProjGravAnchorEEObsObservationsCfg):
+    """ProjGrav anchor EE observations with selected future targets clipped to one step."""
+
+    @configclass
+    class PolicyCfg(ProjGravAnchorEEObsObservationsCfg.PolicyCfg):
+        motion_anchor_pos_b = ObsTerm(
+            func=mdp.motion_anchor_pos_b_future,
+            params={"command_name": "motion", "future_steps": 1},
+            noise=Unoise(n_min=-0.25, n_max=0.25),
+        )
+        motion_anchor_ori_b = ObsTerm(
+            func=mdp.motion_anchor_ori_b_future,
+            params={"command_name": "motion", "future_steps": 1},
+            noise=Unoise(n_min=-0.05, n_max=0.05),
+        )
+        motion_ee_pos_b = ObsTerm(
+            func=mdp.motion_body_pos_b_future,
+            params={"command_name": "motion", "body_names": _EE_BODY_NAMES, "future_steps": 1},
+            noise=Unoise(n_min=-0.1, n_max=0.1),
+        )
+        motion_ee_ori_b = ObsTerm(
+            func=mdp.motion_body_ori_b_future,
+            params={"command_name": "motion", "body_names": _EE_BODY_NAMES, "future_steps": 1},
+            noise=Unoise(n_min=-0.05, n_max=0.05),
+        )
+
+    @configclass
+    class PrivilegedCfg(ProjGravAnchorEEObsObservationsCfg.PrivilegedCfg):
+        motion_anchor_pos_b = ObsTerm(
+            func=mdp.motion_anchor_pos_b_future,
+            params={"command_name": "motion", "future_steps": 1},
+        )
+        motion_anchor_ori_b = ObsTerm(
+            func=mdp.motion_anchor_ori_b_future,
+            params={"command_name": "motion", "future_steps": 1},
+        )
+        motion_ee_pos_b = ObsTerm(
+            func=mdp.motion_body_pos_b_future,
+            params={"command_name": "motion", "body_names": _EE_BODY_NAMES, "future_steps": 1},
+        )
+        motion_ee_ori_b = ObsTerm(
+            func=mdp.motion_body_ori_b_future,
+            params={"command_name": "motion", "body_names": _EE_BODY_NAMES, "future_steps": 1},
+        )
+
+    policy: PolicyCfg = PolicyCfg()
+    critic: PrivilegedCfg = PrivilegedCfg()
+
+
+@configclass
 class PropPropObservationsCfg:
     """Observation specifications for the MDP."""
     @configclass
