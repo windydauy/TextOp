@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools", "toml"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "latent-tracker"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = ["mjlab"]
+
+[tool.setuptools.packages.find]
+where = ["source/latent_tracker"]
+
+[tool.ruff]
+ignore = ["E402", "F541"]
+line-length = 120
+
+
+[tool.yapf]
+based_on_style = "facebook"
+indent_width = 4
+continuation_indent_width = 4
+use_tabs = false
+dedent_closing_brackets = true
+allow_split_before_dict_value = true
+split_before_expression_after_opening_paren = true
+column_limit = 120

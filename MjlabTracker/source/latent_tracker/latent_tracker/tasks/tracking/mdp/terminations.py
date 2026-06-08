@@ -1,0 +1,151 @@
+from __future__ import annotations
+
+import torch
+from typing import TYPE_CHECKING
+from typing import Callable
+
+if TYPE_CHECKING:
+    from mjlab.envs import ManagerBasedRlEnv
+
+from mjlab.entity import Entity
+from mjlab.managers.scene_entity_config import SceneEntityCfg
+from mjlab.utils.lab_api.math import quat_apply_inverse
+
+from latent_tracker.tasks.tracking.mdp import MotionCommand
+from latent_tracker.tasks.tracking.mdp.rewards import _get_body_indexes
+
+
+def joint_pos_out_of_limit(
+    env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    asset: Entity = env.scene[asset_cfg.name]
+    if not hasattr(asset.data, "joint_pos_limits"):
+        return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    limits = asset.data.joint_pos_limits[:, asset_cfg.joint_ids]
+    joint_pos = asset.data.joint_pos[:, asset_cfg.joint_ids]
+    return torch.any((joint_pos < limits[..., 0]) | (joint_pos > limits[..., 1]), dim=1)
+
+
+def joint_vel_out_of_limit(
+    env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    asset: Entity = env.scene[asset_cfg.name]
+    if not hasattr(asset.data, "joint_vel_limits"):
+        return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    limits = asset.data.joint_vel_limits[:, asset_cfg.joint_ids]
+    joint_vel = torch.abs(asset.data.joint_vel[:, asset_cfg.joint_ids])
+    return torch.any(joint_vel > limits, dim=1)
+
+
+def joint_vel_out_of_manual_limit(
+    env: ManagerBasedRlEnv,
+    max_velocity: float,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    asset: Entity = env.scene[asset_cfg.name]
+    return torch.any(torch.abs(asset.data.joint_vel[:, asset_cfg.joint_ids]) > max_velocity, dim=1)
+
+
+def termination_cond_on_pfail(term_fn: Callable) -> Callable:
+    def wrapper(env: ManagerBasedRlEnv, pfail_threshold: float, *args) -> torch.Tensor:
+        termination = term_fn(env, *args)
+        pfail_total = env.command_manager.get_term("motion").metrics["pfail_total"]
+        termination = termination.logical_and(pfail_total < pfail_threshold)
+
+        return termination
+
+    return wrapper
+
+
+def joint_pos_out_of_limit_cond_on_pfail(
+    env: ManagerBasedRlEnv, pfail_threshold: float, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    return termination_cond_on_pfail(joint_pos_out_of_limit)(env, pfail_threshold, asset_cfg)
+
+
+def joint_vel_out_of_limit_cond_on_pfail(
+    env: ManagerBasedRlEnv, pfail_threshold: float, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    return termination_cond_on_pfail(joint_vel_out_of_limit)(env, pfail_threshold, asset_cfg)
+
+
+def joint_vel_out_of_manual_limit_cond_on_pfail(
+    env: ManagerBasedRlEnv,
+    pfail_threshold: float,
+    max_velocity: float,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    return termination_cond_on_pfail(joint_vel_out_of_manual_limit)(env, pfail_threshold, max_velocity, asset_cfg)
+
+
+###########################
+
+
+def joint_effort_out_of_limit_fixed(
+    env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """Terminate when effort applied on the asset's joints are outside of the soft joint limits.
+
+    In the actuators, the applied torque are the efforts applied on the joints. These are computed by clipping
+    the computed torques to the joint limits. Hence, we check if the computed torques are equal to the applied
+    torques.
+    """
+    # extract the used quantities (to enable type-hinting)
+    asset: Entity = env.scene[asset_cfg.name]
+    # check if any joint effort is out of limit
+    out_of_limits = torch.logical_not(
+        torch.isclose(
+            asset.data.qfrc_actuator[:, asset_cfg.joint_ids], asset.data.qfrc_actuator[:, asset_cfg.joint_ids]
+        )
+    )
+    return torch.any(out_of_limits, dim=1)
+
+
+def joint_effort_out_of_limit_fixed_cond_on_pfail(
+    env: ManagerBasedRlEnv, pfail_threshold: float, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    return termination_cond_on_pfail(joint_effort_out_of_limit_fixed)(env, pfail_threshold, asset_cfg)
+
+
+def bad_anchor_pos(env: ManagerBasedRlEnv, command_name: str, threshold: float) -> torch.Tensor:
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    return torch.norm(command.anchor_pos_w - command.robot_anchor_pos_w, dim=1) > threshold
+
+
+def bad_anchor_pos_z_only(env: ManagerBasedRlEnv, command_name: str, threshold: float) -> torch.Tensor:
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    return torch.abs(command.anchor_pos_w[:, -1] - command.robot_anchor_pos_w[:, -1]) > threshold
+
+
+def bad_anchor_ori(
+    env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg, command_name: str, threshold: float
+) -> torch.Tensor:
+    asset: Entity = env.scene[asset_cfg.name]
+
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    motion_projected_gravity_b = quat_apply_inverse(command.anchor_quat_w, asset.data.gravity_vec_w)
+
+    robot_projected_gravity_b = quat_apply_inverse(command.robot_anchor_quat_w, asset.data.gravity_vec_w)
+    # GRAVITY_VEC_W: [0,0,-9.81]
+
+    return (motion_projected_gravity_b[:, 2] - robot_projected_gravity_b[:, 2]).abs() > threshold
+
+
+def bad_motion_body_pos(
+    env: ManagerBasedRlEnv, command_name: str, threshold: float, body_names: list[str] | None = None
+) -> torch.Tensor:
+    command: MotionCommand = env.command_manager.get_term(command_name)
+
+    body_indexes = _get_body_indexes(command, body_names)
+    error = torch.norm(command.body_pos_relative_w[:, body_indexes] - command.robot_body_pos_w[:, body_indexes], dim=-1)
+    return torch.any(error > threshold, dim=-1)
+
+
+def bad_motion_body_pos_z_only(
+    env: ManagerBasedRlEnv, command_name: str, threshold: float, body_names: list[str] | None = None
+) -> torch.Tensor:
+    command: MotionCommand = env.command_manager.get_term(command_name)
+
+    body_indexes = _get_body_indexes(command, body_names)
+    error = torch.abs(command.body_pos_relative_w[:, body_indexes, -1] - command.robot_body_pos_w[:, body_indexes, -1])
+    return torch.any(error > threshold, dim=-1)

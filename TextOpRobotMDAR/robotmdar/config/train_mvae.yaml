@@ -1,7 +1,0 @@
-# @package _global_
-defaults:
-  - base
-  - _self_
-
-expname: VAE
-task: train-mvae

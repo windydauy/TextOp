@@ -1,6 +1,0 @@
-
-defaults:
-  - vis_dar
-  - _self_
-
-task: export-dar
