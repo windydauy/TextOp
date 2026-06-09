@@ -4,6 +4,7 @@ import math
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -31,6 +32,21 @@ if TYPE_CHECKING:
 
 def _decode_npz_names(values) -> list[str]:
     return [str(value.decode("utf-8") if isinstance(value, bytes) else value) for value in list(values)]
+
+
+def resolve_motion_file_paths(motion_files: Sequence[str]) -> list[str]:
+    resolved: list[str] = []
+    for motion_file in motion_files:
+        path = Path(motion_file)
+        if path.is_file():
+            resolved.append(str(path))
+        elif path.is_dir():
+            resolved.extend(str(item) for item in sorted(path.rglob("motion.npz")))
+        else:
+            raise FileNotFoundError(f"Motion path does not exist: {motion_file}")
+    if not resolved:
+        raise FileNotFoundError(f"No motion files resolved from: {list(motion_files)}")
+    return resolved
 
 
 def resolve_motion_joint_indexes(
@@ -107,7 +123,7 @@ class MultiMotionLoader:
                  device: str = "cpu",
                  motion_ae_adapter: MotionAELatentAdapter | None = None,
                  motion_transformer_vae_adapter: MotionTransformerVAELatentAdapter | None = None):
-        assert len(motion_files) > 0, "motion_files 不能为空"
+        motion_files = resolve_motion_file_paths(motion_files)
         self.num_files = len(motion_files)
         self._fallback_body_indexes = [int(index) for index in body_indexes]
         self._requested_body_names = list(body_names) if body_names is not None else []

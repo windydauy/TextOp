@@ -42,11 +42,11 @@ _register(
     flat_env_cfg.G1FlatProjGravObsEnvCfg,
     rsl_rl_ppo_cfg.G1FlatPPORunnerCfg,
 )
-_register(
-    "Mjlab-LatentTracker-Flat-G1-ProjGravObs-MNMLP",
-    flat_env_cfg.G1FlatProjGravObsEnvCfg,
-    rsl_rl_ppo_cfg.G1FlatPPOModNormRunnerCfg,
-)
+# _register(
+#     "Mjlab-LatentTracker-Flat-G1-ProjGravObs-MNMLP",
+#     flat_env_cfg.G1FlatProjGravObsEnvCfg,
+#     rsl_rl_ppo_cfg.G1FlatPPOModNormRunnerCfg,
+# )
 _register(
     "Mjlab-LatentTracker-Flat-G1-ProjGravObs-MNMLP-LargeHand",
     flat_env_cfg.G1FlatProjGravObsEnvCfg_LargeHand,
@@ -63,39 +63,49 @@ _register(
     rsl_rl_ppo_cfg.G1FlatPPORunnerCfg,
 )
 _register(
-    "Mjlab-LatentTracker-Flat-G1-ProjGravAnchorObs-NMMLP",
+    "Mjlab-LatentTracker-Flat-G1-ProjGravAnchorObs",
     flat_env_cfg.G1FlatProjGravAnchorObsEnvCfg,
-    rsl_rl_ppo_cfg.G1FlatPPOModNormRunnerCfg,
+    rsl_rl_ppo_cfg.G1FlatPPORunnerCfg,
 )
 _register(
-    "Mjlab-LatentTracker-Flat-G1-ProjGravAnchorObs-MotionAE-NMMLP",
+    "Mjlab-LatentTracker-Flat-G1-ProjGravAnchorObs-MotionAE",
     flat_env_cfg.G1FlatProjGravAnchorObsMotionAEEnvCfg,
-    rsl_rl_ppo_cfg.G1FlatPPOModNormRunnerCfg,
+    rsl_rl_ppo_cfg.G1FlatPPORunnerCfg,
 )
 _register(
-    "Mjlab-LatentTracker-Flat-G1-ProjGravAnchorEEObs-NMMLP",
+    "Mjlab-LatentTracker-Flat-G1-ProjGravAnchorEEObs",
     flat_env_cfg.G1FlatProjGravAnchorEEObsEnvCfg,
-    rsl_rl_ppo_cfg.G1FlatPPOModNormRunnerCfg,
+    rsl_rl_ppo_cfg.G1FlatPPORunnerCfg,
 )
+# _register(
+#     "Mjlab-LatentTracker-Flat-G1-ProjGravAnchorObs-TransformerVAE-NMMLP",
+#     flat_env_cfg.G1FlatProjGravAnchorObsTransformerVAEEnvCfg,
+#     rsl_rl_ppo_cfg.G1FlatPPOModNormRunnerCfg,
+# )
 _register(
-    "Mjlab-LatentTracker-Flat-G1-ProjGravAnchorObs-TransformerVAE-NMMLP",
+    "Mjlab-LatentTracker-Flat-G1-ProjGravAnchorObs-TransformerVAE",
     flat_env_cfg.G1FlatProjGravAnchorObsTransformerVAEEnvCfg,
-    rsl_rl_ppo_cfg.G1FlatPPOModNormRunnerCfg,
+    rsl_rl_ppo_cfg.G1FlatPPORunnerCfg,
 )
 _register(
-    "Mjlab-LatentTracker-Flat-G1-ProjGravAnchorEEObs-TransformerVAE-NMMLP",
+    "Mjlab-LatentTracker-Flat-G1-ProjGravAnchorEEObs-TransformerVAE",
     flat_env_cfg.G1FlatProjGravAnchorEEObsTransformerVAEEnvCfg,
-    rsl_rl_ppo_cfg.G1FlatPPOModNormRunnerCfg,
+    rsl_rl_ppo_cfg.G1FlatPPORunnerCfg,
 )
 _register(
-    "Mjlab-LatentTracker-Flat-G1-ProjGravAnchorEEObs-TransformerVAE-SplitBodyReward-NMMLP",
+    "Mjlab-LatentTracker-Flat-G1-ProjGravAnchorEEObs-TransformerVAE-SplitBodyReward",
     flat_env_cfg.G1FlatProjGravAnchorEEObsTransformerVAESplitBodyRewardEnvCfg,
-    rsl_rl_ppo_cfg.G1FlatPPOModNormRunnerCfg,
+    rsl_rl_ppo_cfg.G1FlatPPORunnerCfg,
 )
+# _register(
+#     "Mjlab-LatentTracker-Flat-G1-ProjGravAnchorEEObs-DirectRefMotion-NMMLP",
+#     flat_env_cfg.G1FlatProjGravAnchorEEObsDirectRefMotionEnvCfg,
+#     rsl_rl_ppo_cfg.G1FlatPPOModNormRunnerCfg,
+# )
 _register(
-    "Mjlab-LatentTracker-Flat-G1-ProjGravAnchorEEObs-DirectRefMotion-NMMLP",
+    "Mjlab-LatentTracker-Flat-G1-ProjGravAnchorEEObs-DirectRefMotion",
     flat_env_cfg.G1FlatProjGravAnchorEEObsDirectRefMotionEnvCfg,
-    rsl_rl_ppo_cfg.G1FlatPPOModNormRunnerCfg,
+    rsl_rl_ppo_cfg.G1FlatPPORunnerCfg,
 )
 _register(
     "Mjlab-LatentTracker-Flat-G1-Low-Freq",

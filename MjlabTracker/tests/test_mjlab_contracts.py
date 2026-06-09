@@ -5,7 +5,7 @@ import numpy as np
 import latent_tracker  # noqa: F401
 from latent_tracker.tasks.tracking.config.g1.flat_env_cfg import G1FlatEnvCfg
 from latent_tracker.tasks.tracking.mdp import MotionCommandCfg
-from latent_tracker.tasks.tracking.mdp.commands_multi import MultiMotionLoader
+from latent_tracker.tasks.tracking.mdp.commands_multi import MultiMotionLoader, resolve_motion_file_paths
 from latent_tracker.tasks.tracking.tracking_env_cfg import TRACKED_BODY_NAMES
 from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.tasks.registry import list_tasks
@@ -97,6 +97,33 @@ def test_motion_loader_reorders_joints_to_robot_order() -> None:
     assert reindex != list(range(len(reindex)))
     np.testing.assert_allclose(loader.joint_pos_list[0].cpu().numpy(), data["joint_pos"][:, reindex])
     np.testing.assert_allclose(loader.joint_vel_list[0].cpu().numpy(), data["joint_vel"][:, reindex])
+
+
+def test_motion_file_paths_expand_directories(tmp_path) -> None:
+    root = tmp_path / "motions"
+    nested = root / "subject" / "clip"
+    nested.mkdir(parents=True)
+    motion_a = nested / "motion.npz"
+    motion_a.write_bytes(b"")
+    ignored_npz = nested / "other.npz"
+    ignored_npz.write_bytes(b"")
+
+    explicit = tmp_path / "custom_name.npz"
+    explicit.write_bytes(b"")
+
+    assert resolve_motion_file_paths([str(root), str(explicit)]) == [str(motion_a), str(explicit)]
+
+
+def test_motion_file_paths_reject_empty_directories(tmp_path) -> None:
+    empty_dir = tmp_path / "empty"
+    empty_dir.mkdir()
+
+    try:
+        resolve_motion_file_paths([str(empty_dir)])
+    except FileNotFoundError as exc:
+        assert "No motion files resolved" in str(exc)
+    else:
+        raise AssertionError("Expected FileNotFoundError for empty motion directory")
 
 
 def test_registers_all_g1_latent_tracker_variants() -> None:
