@@ -76,6 +76,41 @@ Sonic 的关键差异：
 
 因此 Sonic release 的 `200` 仍然偏激进，但它有累计统计和 failure-rate cap；TextOp 当前 `alpha=0.1` 且没有 hard cap，实际更容易快速集中到少数 clips。
 
+## TextOp 新增 `ads_type=gear_sonic`
+
+TextOp 现在新增了独立的 Sonic 风格采样分支：
+
+```bash
+env.commands.motion.enable_adaptive_sampling=True
+env.commands.motion.ads_type=gear_sonic
+env.commands.motion.gear_sonic_bin_size=50
+env.commands.motion.gear_sonic_uniform_sampling_rate=0.1
+env.commands.motion.gear_sonic_failure_rate_max_over_mean=200
+env.commands.motion.gear_sonic_pre_failure_sample_window=200
+```
+
+这个分支不改变现有 `v1/v2/v3`：
+
+- `v2` 仍然使用 TextOp 原来的 EMA motion-level 失败率、`adaptive_beta` 和 `adaptive_uniform_ratio`。
+- `v3` 保留旧公式 `1 - (1 - p_fail) ** adaptive_beta`，不是 Sonic alias。
+- `gear_sonic` 使用 bin/frame-level 统计和采样：每条 motion 按 `gear_sonic_bin_size` frames 切 bin，episode 结束时按结束 frame 更新对应 bin 的 episode/failure count，然后从 bin 分布采样新的 motion 和起始 frame。
+
+`gear_sonic` 的核心公式与 Sonic 对齐：
+
+```text
+failure_rate = num_failures / num_episodes
+failure_rate = clip(
+    failure_rate,
+    max = mean(failure_rate) * gear_sonic_failure_rate_max_over_mean,
+)
+
+p_fail = failure_rate / sum(failure_rate)
+p_sample = (1 - uniform_rate) * p_fail + uniform_rate * uniform
+p_sample = normalize(p_sample * bin_weight)
+```
+
+其中 `gear_sonic_sequence_length_agnostic=True` 时会按每条 motion 的 bin 数修正 `bin_weight`，避免长 motion 仅因为更长就获得更高总采样概率。`gear_sonic_pre_failure_sample_window` 会把采样 frame 随机向失败前偏移，用来练习失败发生前的状态。
+
 ## 建议的 TextOp 修正
 
 第一阶段建议先做稳定性 ablation：

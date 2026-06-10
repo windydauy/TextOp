@@ -95,18 +95,44 @@ class MotionOnPolicyRunner(OnPolicyRunner):
 
         # For DEBUG:
         if unwrapped_env.command_manager.get_term("motion").cfg.enable_adaptive_sampling:
-            fail_count = unwrapped_env.command_manager.get_term("motion").failed_motion_count.cpu().numpy()
-            success_count = unwrapped_env.command_manager.get_term("motion").success_motion_count.cpu().numpy()
+            motion_command = unwrapped_env.command_manager.get_term("motion")
+            if motion_command.cfg.ads_type == "gear_sonic":
+                adpsam_count = {
+                    "ads_type": "gear_sonic",
+                    "gear_sonic_bins": motion_command.gear_sonic_bins.cpu().numpy(),
+                    "gear_sonic_bin_weights": motion_command.gear_sonic_bin_weights.cpu().numpy(),
+                    "gear_sonic_num_episodes": motion_command.gear_sonic_num_episodes.cpu().numpy(),
+                    "gear_sonic_num_failures": motion_command.gear_sonic_num_failures.cpu().numpy(),
+                    "gear_sonic_failure_rate": motion_command.gear_sonic_failure_rate.cpu().numpy(),
+                    "gear_sonic_sampling_probabilities": (
+                        motion_command.gear_sonic_sampling_probabilities.cpu().numpy()
+                    ),
+                    "gear_sonic_bin_size": motion_command.cfg.gear_sonic_bin_size,
+                    "gear_sonic_uniform_sampling_rate": (
+                        motion_command.cfg.gear_sonic_uniform_sampling_rate
+                    ),
+                    "gear_sonic_failure_rate_max_over_mean": (
+                        motion_command.cfg.gear_sonic_failure_rate_max_over_mean
+                    ),
+                    "gear_sonic_pre_failure_sample_window": (
+                        motion_command.cfg.gear_sonic_pre_failure_sample_window
+                    ),
+                }
+                pickle.dump(adpsam_count, open(path[:-len(".pt")] + "-adpsam_count.pkl", "wb"))
+                return
+
+            fail_count = motion_command.failed_motion_count.cpu().numpy()
+            success_count = motion_command.success_motion_count.cpu().numpy()
             total_count = fail_count + success_count
             p_fail = fail_count / (total_count + 1e-8)
-            p_fail_sample_v2 = (p_fail**unwrapped_env.command_manager.get_term("motion").cfg.adaptive_beta)
+            p_fail_sample_v2 = (p_fail**motion_command.cfg.adaptive_beta)
             p_fail_sample_v2 = p_fail_sample_v2 / (p_fail_sample_v2.sum() + 1e-8)
             sampling_probabilities_v2 = (
-                p_fail_sample_v2 * (1 - unwrapped_env.command_manager.get_term("motion").cfg.adaptive_uniform_ratio) +
-                unwrapped_env.command_manager.get_term("motion").cfg.adaptive_uniform_ratio /
-                float(unwrapped_env.command_manager.get_term("motion").num_motion)
+                p_fail_sample_v2 * (1 - motion_command.cfg.adaptive_uniform_ratio) +
+                motion_command.cfg.adaptive_uniform_ratio /
+                float(motion_command.num_motion)
             )
-            max_prob_over_uniform = unwrapped_env.command_manager.get_term("motion").cfg.max_prob_over_uniform
+            max_prob_over_uniform = motion_command.cfg.max_prob_over_uniform
             sampling_probabilities_v2_capped = _cap_probabilities_over_uniform(
                 sampling_probabilities_v2, max_prob_over_uniform)
             adpsam_count = {

@@ -314,11 +314,13 @@ class MotionCommand(CommandTerm):
                                                        dtype=torch.float,
                                                        device=self.device)
         self.current_success_motion_count = torch.zeros(self.num_motion,
-                                                        dtype=torch.float,
-                                                        device=self.device)
+                                                         dtype=torch.float,
+                                                         device=self.device)
 
         if self.cfg.adaptive_length_weighted:
             assert self.cfg.ads_type == "v1", "Adaptive length weighted is only supported for v1 adaptive sampling type"
+        if self.cfg.ads_type == "gear_sonic":
+            self._init_gear_sonic_adaptive_sampling()
 
         self.metrics["error_anchor_pos"] = torch.zeros(self.num_envs,
                                                        device=self.device)
@@ -353,6 +355,80 @@ class MotionCommand(CommandTerm):
         self.metrics["freeze_frame_aug_ratio"] = torch.zeros(
             self.num_envs, device=self.device)
         # self.metrics["sampling_top1_bin"] = torch.zeros(self.num_envs, device=self.device)
+
+    def _init_gear_sonic_adaptive_sampling(self):
+        bin_size = int(self.cfg.gear_sonic_bin_size)
+        if bin_size <= 0:
+            raise ValueError(f"gear_sonic_bin_size must be > 0, got {bin_size}")
+        if not 0.0 <= self.cfg.gear_sonic_uniform_sampling_rate <= 1.0:
+            raise ValueError(
+                "gear_sonic_uniform_sampling_rate must be in [0, 1], "
+                f"got {self.cfg.gear_sonic_uniform_sampling_rate}"
+            )
+        if self.cfg.gear_sonic_failure_rate_max_over_mean <= 0:
+            raise ValueError(
+                "gear_sonic_failure_rate_max_over_mean must be > 0, "
+                f"got {self.cfg.gear_sonic_failure_rate_max_over_mean}"
+            )
+
+        bins: list[list[int]] = []
+        bin_lengths: list[int] = []
+        motion_bin_start: list[int] = []
+        motion_num_bins: list[int] = []
+        cur_bin = 0
+        for motion_id, motion_length_tensor in enumerate(self.motion.file_lengths):
+            motion_length = int(motion_length_tensor.item())
+            num_bins = max(1, math.ceil(motion_length / bin_size))
+            motion_bin_start.append(cur_bin)
+            motion_num_bins.append(num_bins)
+            for bin_idx in range(num_bins):
+                start = bin_idx * bin_size
+                end = min(start + bin_size, motion_length)
+                bins.append([motion_id, start, end])
+                bin_lengths.append(max(end - start, 1))
+            cur_bin += num_bins
+
+        self.gear_sonic_bins = torch.tensor(bins, dtype=torch.long, device=self.device)
+        self.gear_sonic_bin_motion_length = torch.tensor(
+            bin_lengths, dtype=torch.float32, device=self.device
+        )
+        self.gear_sonic_motion_bin_start = torch.tensor(
+            motion_bin_start, dtype=torch.long, device=self.device
+        )
+        self.gear_sonic_motion_num_bins = torch.tensor(
+            motion_num_bins, dtype=torch.long, device=self.device
+        )
+        self.gear_sonic_num_bins = int(self.gear_sonic_bins.shape[0])
+
+        self.gear_sonic_bin_weights = (
+            self.gear_sonic_bin_motion_length /
+            self.gear_sonic_bin_motion_length.float().mean().clamp_min(1e-8)
+        )
+        if self.cfg.gear_sonic_sequence_length_agnostic:
+            peer_bins = self.gear_sonic_motion_num_bins[
+                self.gear_sonic_bins[:, 0]
+            ].float()
+            self.gear_sonic_bin_weights = self.gear_sonic_bin_weights / peer_bins.clamp_min(1.0)
+
+        init_num_failures = float(self.cfg.gear_sonic_init_num_failures)
+        self.gear_sonic_num_failures = torch.full(
+            (self.gear_sonic_num_bins,),
+            init_num_failures,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        self.gear_sonic_num_episodes = torch.full(
+            (self.gear_sonic_num_bins,),
+            init_num_failures,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        self.gear_sonic_failure_rate = torch.ones(
+            self.gear_sonic_num_bins, dtype=torch.float32, device=self.device
+        )
+        self.gear_sonic_sampling_probabilities = torch.ones(
+            self.gear_sonic_num_bins, dtype=torch.float32, device=self.device
+        ) / float(self.gear_sonic_num_bins)
 
     def _init_buffers(self):
         """初始化buffer存储轨迹数据"""
@@ -874,6 +950,127 @@ class MotionCommand(CommandTerm):
         capped = capped / capped.sum().clamp_min(1e-12)
         return capped.to(dtype=probabilities.dtype)
 
+    def _gear_sonic_bin_ids(self, motion_ids: torch.Tensor, time_steps: torch.Tensor) -> torch.Tensor:
+        motion_ids = motion_ids.long()
+        motion_lengths = self.motion.file_lengths[motion_ids]
+        clamped_time_steps = torch.minimum(
+            torch.clamp(time_steps.long(), min=0),
+            motion_lengths - 1,
+        )
+        bin_offsets = torch.div(
+            clamped_time_steps,
+            int(self.cfg.gear_sonic_bin_size),
+            rounding_mode="floor",
+        )
+        bin_offsets = torch.minimum(
+            bin_offsets,
+            self.gear_sonic_motion_num_bins[motion_ids] - 1,
+        )
+        return self.gear_sonic_motion_bin_start[motion_ids] + bin_offsets
+
+    def _gear_sonic_update_sampling_probabilities(self) -> torch.Tensor:
+        failure_rate = self.gear_sonic_num_failures / self.gear_sonic_num_episodes.clamp_min(1e-8)
+        self.gear_sonic_failure_rate = failure_rate
+        failure_rate_upper_bound = (
+            failure_rate.mean() * float(self.cfg.gear_sonic_failure_rate_max_over_mean)
+        )
+        failure_rate_clipped = torch.clamp(failure_rate, 0.0, failure_rate_upper_bound)
+        failure_sum = failure_rate_clipped.sum()
+        if failure_sum <= 0:
+            failure_based_prob = torch.ones_like(failure_rate_clipped) / float(self.gear_sonic_num_bins)
+        else:
+            failure_based_prob = failure_rate_clipped / failure_sum
+
+        uniform_prob = torch.ones_like(failure_based_prob) / float(self.gear_sonic_num_bins)
+        uniform_rate = float(self.cfg.gear_sonic_uniform_sampling_rate)
+        sampling_probabilities = (
+            failure_based_prob * (1.0 - uniform_rate) +
+            uniform_prob * uniform_rate
+        )
+        sampling_probabilities = sampling_probabilities * self.gear_sonic_bin_weights
+        sampling_probabilities = sampling_probabilities / sampling_probabilities.sum().clamp_min(1e-12)
+        self.gear_sonic_sampling_probabilities = sampling_probabilities.float()
+        return self.gear_sonic_sampling_probabilities
+
+    def _gear_sonic_adaptive_sampling(self, env_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        episode_failed: torch.Tensor = self._env.termination_manager.terminated[env_ids]  # type:ignore
+        valid_previous = self.motion_length[env_ids] > 0
+        stats_env_ids = env_ids[valid_previous]
+        stats_failed = episode_failed[valid_previous]
+
+        self.current_failed_motion_count.zero_()
+        self.current_success_motion_count.zero_()
+        if len(stats_env_ids) > 0:
+            motion_ids = self.motion_idx[stats_env_ids]
+            time_steps = self.time_steps[stats_env_ids]
+            bin_ids = self._gear_sonic_bin_ids(motion_ids, time_steps)
+            episode_counts = torch.bincount(
+                bin_ids, minlength=self.gear_sonic_num_bins
+            ).to(self.gear_sonic_num_episodes.dtype)
+            self.gear_sonic_num_episodes += (
+                episode_counts / self.gear_sonic_bin_motion_length.clamp_min(1.0)
+            )
+
+            if torch.any(stats_failed):
+                failed_motion_ids = motion_ids[stats_failed]
+                failed_bin_ids = bin_ids[stats_failed]
+                failure_counts = torch.bincount(
+                    failed_bin_ids, minlength=self.gear_sonic_num_bins
+                ).to(self.gear_sonic_num_failures.dtype)
+                self.gear_sonic_num_failures += (
+                    failure_counts * float(self.cfg.gear_sonic_failure_counts_multiplier)
+                )
+                self.current_failed_motion_count[:] = torch.bincount(
+                    failed_motion_ids, minlength=self.num_motion
+                ).to(self.current_failed_motion_count.dtype)
+
+            if torch.any(~stats_failed):
+                success_motion_ids = motion_ids[~stats_failed]
+                self.current_success_motion_count[:] = torch.bincount(
+                    success_motion_ids, minlength=self.num_motion
+                ).to(self.current_success_motion_count.dtype)
+
+        sampling_probabilities = self._gear_sonic_update_sampling_probabilities()
+        sampled_bin_ids = torch.multinomial(
+            sampling_probabilities, len(env_ids), replacement=True
+        )
+        sampled_bins = self.gear_sonic_bins[sampled_bin_ids]
+        sampled_motion_ids = sampled_bins[:, 0].long()
+        bin_start = sampled_bins[:, 1].long()
+        bin_end = sampled_bins[:, 2].long()
+        bin_lengths = torch.clamp(bin_end - bin_start, min=1)
+        sampled_time_steps = (
+            torch.rand(len(env_ids), device=self.device) * bin_lengths.float()
+        ).floor().long() + bin_start
+
+        pre_failure_sample_window = int(self.cfg.gear_sonic_pre_failure_sample_window)
+        if pre_failure_sample_window > 0:
+            offset = torch.randint(
+                pre_failure_sample_window,
+                (len(env_ids),),
+                device=self.device,
+            )
+            sampled_time_steps = torch.clamp(sampled_time_steps - offset, min=0)
+
+        H_samp = -(sampling_probabilities *
+                   (sampling_probabilities + 1e-12).log()).sum()
+        entropy_den = max(math.log(self.gear_sonic_num_bins), 1e-8)
+        H_samp_norm = H_samp / entropy_den
+
+        failure_rate_norm = self.gear_sonic_failure_rate / (
+            self.gear_sonic_failure_rate.sum() + 1e-8
+        )
+        H_pfail = -(failure_rate_norm *
+                    (failure_rate_norm + 1e-12).log()).sum()
+        H_pfail_norm = H_pfail / entropy_den
+
+        pmax, _ = sampling_probabilities.max(dim=0)
+        self.metrics["sampling_entropy"][:] = H_samp_norm
+        self.metrics["pfail_entropy"][:] = H_pfail_norm
+        self.metrics["pfail_mean"][:] = self.gear_sonic_failure_rate.mean()
+        self.metrics["sampling_top1_prob"][:] = pmax
+        return sampled_motion_ids, sampled_time_steps
+
     def _adaptive_sampling(self, env_ids: torch.Tensor) -> torch.Tensor:
         episode_failed: torch.Tensor = self._env.termination_manager.terminated[
             env_ids]  # type:ignore
@@ -967,7 +1164,11 @@ class MotionCommand(CommandTerm):
         if len(env_ids) == 0:
             return
 
-        if self.cfg.enable_adaptive_sampling:
+        gear_sonic_sampled_time_steps = None
+        if self.cfg.enable_adaptive_sampling and self.cfg.ads_type == "gear_sonic":
+            sampled_motion_ids, gear_sonic_sampled_time_steps = self._gear_sonic_adaptive_sampling(env_ids)
+            self.motion_idx[env_ids] = sampled_motion_ids
+        elif self.cfg.enable_adaptive_sampling:
             self.motion_idx[env_ids] = self._adaptive_sampling(env_ids)
         else:
             self.motion_idx[env_ids] = self._uniform_sampling(env_ids)
@@ -975,7 +1176,12 @@ class MotionCommand(CommandTerm):
         self.motion_length[env_ids] = self.motion.file_lengths[
             self.motion_idx[env_ids]]
 
-        if self.cfg.start_from_zero_step:
+        if gear_sonic_sampled_time_steps is not None:
+            self.time_steps[env_ids] = torch.minimum(
+                gear_sonic_sampled_time_steps,
+                self.motion_length[env_ids] - 1,
+            )
+        elif self.cfg.start_from_zero_step:
             self.time_steps[env_ids] = torch.zeros(len(env_ids),
                                                    dtype=torch.long,
                                                    device=self.device)
@@ -1286,6 +1492,13 @@ class MotionCommandCfg(CommandTermCfg):
     adaptive_alpha: float = 0.001
     adaptive_beta: float = 0.5
     max_prob_over_uniform: float = 0.0
+    gear_sonic_bin_size: int = 50
+    gear_sonic_init_num_failures: float = 1.0
+    gear_sonic_uniform_sampling_rate: float = 0.1
+    gear_sonic_failure_rate_max_over_mean: float = 50.0
+    gear_sonic_pre_failure_sample_window: int = 200
+    gear_sonic_sequence_length_agnostic: bool = True
+    gear_sonic_failure_counts_multiplier: float = 1.0
 
     # Random Static
     random_static_prob: float = -1.0
