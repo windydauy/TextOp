@@ -34,10 +34,14 @@ class PPO:
         value_loss_coef=1.0,
         entropy_coef=0.0,
         learning_rate=1e-3,
+        actor_learning_rate=None,
+        critic_learning_rate=None,
         max_grad_norm=1.0,
         use_clipped_value_loss=True,
         schedule="fixed",
         desired_kl=0.01,
+        adaptive_lr_min=1e-5,
+        adaptive_lr_max=1e-2,
         device="cpu",
         normalize_advantage_per_mini_batch=False,
         # RND parameters
@@ -96,7 +100,28 @@ class PPO:
         self.policy = policy
         self.policy.to(self.device)
         # Create optimizer
-        self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
+        actor_learning_rate = learning_rate if actor_learning_rate is None else actor_learning_rate
+        self.actor_learning_rate = actor_learning_rate
+        self.critic_learning_rate = critic_learning_rate
+        if critic_learning_rate is not None and hasattr(self.policy, "actor") and hasattr(self.policy, "critic"):
+            actor_params = list(self.policy.actor.parameters())
+            if hasattr(self.policy, "std"):
+                actor_params.append(self.policy.std)
+            if hasattr(self.policy, "log_std"):
+                actor_params.append(self.policy.log_std)
+            critic_params = list(self.policy.critic.parameters())
+
+            grouped_param_ids = {id(param) for param in actor_params + critic_params}
+            other_params = [param for param in self.policy.parameters() if id(param) not in grouped_param_ids]
+            param_groups = [
+                {"params": actor_params, "lr": actor_learning_rate, "adaptive_lr": True},
+                {"params": critic_params, "lr": critic_learning_rate, "adaptive_lr": False},
+            ]
+            if other_params:
+                param_groups.append({"params": other_params, "lr": actor_learning_rate, "adaptive_lr": True})
+            self.optimizer = optim.Adam(param_groups)
+        else:
+            self.optimizer = optim.Adam(self.policy.parameters(), lr=actor_learning_rate)
         # Create rollout storage
         self.storage: RolloutStorage = None  # type: ignore
         self.transition = RolloutStorage.Transition()
@@ -113,7 +138,9 @@ class PPO:
         self.use_clipped_value_loss = use_clipped_value_loss
         self.desired_kl = desired_kl
         self.schedule = schedule
-        self.learning_rate = learning_rate
+        self.learning_rate = actor_learning_rate
+        self.adaptive_lr_min = adaptive_lr_min
+        self.adaptive_lr_max = adaptive_lr_max
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
 
     def init_storage(
@@ -291,9 +318,9 @@ class PPO:
                     #       then the learning rate should be the same across all GPUs.
                     if self.gpu_global_rank == 0:
                         if kl_mean > self.desired_kl * 2.0:
-                            self.learning_rate = max(1e-5, self.learning_rate / 1.5)
+                            self.learning_rate = max(self.adaptive_lr_min, self.learning_rate / 1.5)
                         elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
-                            self.learning_rate = min(1e-2, self.learning_rate * 1.5)
+                            self.learning_rate = min(self.adaptive_lr_max, self.learning_rate * 1.5)
 
                     # Update the learning rate for all GPUs
                     if self.is_multi_gpu:
@@ -303,7 +330,8 @@ class PPO:
 
                     # Update the learning rate for all parameter groups
                     for param_group in self.optimizer.param_groups:
-                        param_group["lr"] = self.learning_rate
+                        if param_group.get("adaptive_lr", True):
+                            param_group["lr"] = self.learning_rate
 
             # Surrogate loss
             ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))

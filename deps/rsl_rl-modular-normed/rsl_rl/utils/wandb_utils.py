@@ -71,9 +71,15 @@ class WandbSummaryWriter(SummaryWriter):
         self.store_config(env_cfg, runner_cfg, alg_cfg, policy_cfg)
 
     def save_model(self, model_path, iter):
+        # Keep checkpoints local. Uploading large .pt files to wandb is expensive
+        # and unnecessary for long cloud runs.
+        if str(model_path).endswith(".pt"):
+            return
         wandb.save(model_path, base_path=os.path.dirname(model_path))
 
     def save_file(self, path, iter=None):
+        if str(path).endswith(".pt"):
+            return
         wandb.save(path, base_path=os.path.dirname(path))
 
     """

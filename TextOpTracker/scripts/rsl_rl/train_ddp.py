@@ -16,7 +16,6 @@ import os
 import sys
 from contextlib import contextmanager
 
-from isaaclab.app import AppLauncher
 import torch
 
 # local imports
@@ -69,6 +68,30 @@ def _ddp_barrier() -> None:
         torch.distributed.barrier()
 
 
+def _initialize_distributed_before_isaac() -> None:
+    """Join the torchrun process group before importing Isaac/Kit."""
+    if not is_distributed:
+        return
+
+    torch.cuda.set_device(local_rank)
+    if torch.distributed.is_initialized():
+        return
+
+    backend = _ddp_backend()
+    _ddp_log(f"initializing {backend} process group before Isaac import")
+    init_kwargs = {"backend": backend, "init_method": "env://"}
+    if backend == "nccl":
+        init_kwargs["device_id"] = torch.device(rank_device)
+    torch.distributed.init_process_group(**init_kwargs)
+    _ddp_barrier()
+    _ddp_log(f"early {backend} barrier passed")
+
+
+_initialize_distributed_before_isaac()
+
+from isaaclab.app import AppLauncher
+
+
 # add argparse arguments
 parser = argparse.ArgumentParser(description="DDP train an RL agent with RSL-RL.")
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
@@ -105,22 +128,12 @@ if is_distributed:
     args_cli.distributed = True
     args_cli.multi_gpu = True
 
-    torch.cuda.set_device(local_rank)
-    if not torch.distributed.is_initialized():
-        backend = _ddp_backend()
-        _ddp_log(f"initializing {backend} process group before Isaac AppLauncher")
-        init_kwargs = {"backend": backend, "rank": rank, "world_size": world_size}
-        if backend == "nccl":
-            init_kwargs["device_id"] = torch.device(rank_device)
-        torch.distributed.init_process_group(**init_kwargs)
-        _ddp_barrier()
-        _ddp_log(f"early {backend} barrier passed")
-
 # clear out sys.argv for Hydra
 sys.argv = [sys.argv[0]] + hydra_args
 
 # launch omniverse app; serialize startup to avoid multi-process launcher races
 _ddp_log("waiting for Isaac AppLauncher lock")
+simulation_app = None
 with _file_lock("/tmp/textop_isaaclab_app_launcher.lock"):
     _ddp_log("starting Isaac AppLauncher")
     app_launcher = AppLauncher(args_cli)
@@ -313,6 +326,9 @@ def _ddp_env_summary(env_cfg, motion_files: list[str]) -> dict:
                 "adaptive_uniform_ratio": _to_plain_value(
                     getattr(motion_cfg, "adaptive_uniform_ratio", None)
                 ),
+                "max_prob_over_uniform": _to_plain_value(
+                    getattr(motion_cfg, "max_prob_over_uniform", None)
+                ),
             }
         },
         "rewards": rewards,
@@ -420,4 +436,5 @@ if __name__ == "__main__":
     finally:
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()
-        simulation_app.close()
+        if simulation_app is not None:
+            simulation_app.close()

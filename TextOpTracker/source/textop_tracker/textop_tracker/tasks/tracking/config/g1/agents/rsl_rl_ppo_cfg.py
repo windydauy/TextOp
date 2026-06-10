@@ -3,6 +3,14 @@ from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, R
 
 
 @configclass
+class TextOpRslRlPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
+    actor_learning_rate: float | None = None
+    critic_learning_rate: float | None = None
+    adaptive_lr_min: float = 1.0e-5
+    adaptive_lr_max: float = 2.0e-4
+
+
+@configclass
 class G1FlatPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 24
     max_iterations = 100000
@@ -10,19 +18,21 @@ class G1FlatPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     experiment_name = "g1_flat"
     empirical_normalization = True
     policy = RslRlPpoActorCriticCfg(
-        init_noise_std=1.0,
+        init_noise_std=0.8,
         actor_hidden_dims=[512, 256, 128],
         critic_hidden_dims=[512, 256, 128],
         activation="elu",
     )
-    algorithm = RslRlPpoAlgorithmCfg(
+    algorithm = TextOpRslRlPpoAlgorithmCfg(
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         clip_param=0.2,
         entropy_coef=0.005,
         num_learning_epochs=5,
         num_mini_batches=4,
-        learning_rate=1.0e-3,
+        learning_rate=2.0e-5,
+        actor_learning_rate=2.0e-5,
+        critic_learning_rate=1.0e-3,
         schedule="adaptive",
         gamma=0.99,
         lam=0.95,
@@ -40,12 +50,12 @@ class G1FlatPPOModNormRunnerCfg(RslRlOnPolicyRunnerCfg):
     empirical_normalization = True
     policy = RslRlPpoActorCriticCfg(
         class_name="ActorCriticMNMLP",
-        init_noise_std=1.0,
+        init_noise_std=0.8,
         actor_hidden_dims=[512, 256, 128],
         critic_hidden_dims=[512, 256, 128],
         activation="elu",
     )
-    algorithm = RslRlPpoAlgorithmCfg(
+    algorithm = TextOpRslRlPpoAlgorithmCfg(
         class_name="PPO_MNMLP",
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
@@ -53,7 +63,9 @@ class G1FlatPPOModNormRunnerCfg(RslRlOnPolicyRunnerCfg):
         entropy_coef=0.005,
         num_learning_epochs=5,
         num_mini_batches=4,
-        learning_rate=1.0e-3,
+        learning_rate=2.0e-5,
+        actor_learning_rate=2.0e-5,
+        critic_learning_rate=1.0e-3,
         schedule="adaptive",
         gamma=0.99,
         lam=0.95,

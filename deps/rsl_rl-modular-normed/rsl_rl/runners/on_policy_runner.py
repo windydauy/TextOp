@@ -481,7 +481,13 @@ class OnPolicyRunner:
 
         # load optimizer if used
         if load_optimizer and resumed_training:
-            self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
+            try:
+                self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
+            except ValueError as exc:
+                print(
+                    "[WARN] Skipping optimizer state load because the optimizer "
+                    f"parameter groups are incompatible with the current config: {exc}"
+                )
             if self.alg.rnd:
                 self.alg.rnd_optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
 

@@ -1,0 +1,538 @@
+================================================================================
+TextOpTracker vs gear_sonic SONIC release：进一步差异分析
+================================================================================
+
+本文补充已有两份总结：
+
+  - /data/yzh/TextOp/docs/ppo_domain_random_compare_textop_vs_gear_sonic.txt
+  - /data/yzh/TextOp/docs/latent_space_compare_textop_vs_sonic_g1_5point_ori_lite.txt
+
+新的 SONIC 对比基准：
+
+  - /data/yzh/GR00T-WholeBodyControl/gear_sonic/config/exp/manager/universal_token/all_modes/sonic_release.yaml
+
+注意：sonic_release.yaml 不是之前对比的 G1-only 5-point-lite 配置。它是 release
+checkpoint 的 finetune 配置，使用 universal token policy，并且同时覆盖三类 motion
+接口：
+
+  1. G1 robot motion
+  2. teleop / VR-style target
+  3. SMPL motion
+
+
+================================================================================
+1. SONIC release 是多接口 latent，对比对象不能再按 G1-only 理解
+================================================================================
+
+sonic_release.yaml 的关键 defaults：
+
+  - /algo: ppo_im_phc
+  - /manager_env: base_env
+  - /actor_critic: universal_token/all_mlp_v1
+  - /manager_env/observations/tokenizer: unitoken_all_noz
+  - /aux_losses: universal_token/g1_recon_and_all_latent
+
+和之前 G1-only lite 配置相比，release 配置最大的变化是：
+
+  - 不只是 G1 encoder。
+  - 同时有 G1、teleop、SMPL 三路 encoder。
+  - PPO actor backbone 内部训练统一 latent/token 表达。
+  - 有多路 latent alignment auxiliary loss。
+
+aux loss 配置：
+
+  - g1_recon: 0.01
+  - g1_smpl_latent: 1.0
+  - g1_teleop_latent: 1.0
+  - teleop_smpl_latent: 1.0
+  - reencoded_smpl_g1_latent: 1.0
+
+actor backbone 还打开了：
+
+  - reencode_smpl_g1_recon: true
+
+结论：
+
+  TextOpTracker 当前更像是“先用外部 frozen Transformer VAE 得到 motion latent，
+  再把 latent 作为 policy obs”。SONIC release 则是“policy backbone 本身就是
+  一个多接口 latent/token 学习器”，G1、teleop、SMPL 的表示在 PPO 训练中被一起
+  对齐。
+
+
+================================================================================
+2. unitoken_all_noz 这个名字有误导性：release 配置仍然包含 z 信息
+================================================================================
+
+tokenizer 文件：
+
+  - /data/yzh/GR00T-WholeBodyControl/gear_sonic/config/manager_env/observations/tokenizer/unitoken_all_noz.yaml
+
+虽然名字叫 unitoken_all_noz，但 release 配置链里 tokenizer 仍然包含：
+
+  - command_z_multi_future_nonflat
+  - command_z
+
+G1 encoder 输入包括：
+
+  - command_multi_future_nonflat
+  - motion_anchor_ori_b_mf_nonflat
+  - command_z_multi_future_nonflat
+
+teleop encoder 输入包括：
+
+  - command_multi_future_lower_body
+  - vr_3point_local_target
+  - vr_3point_local_orn_target
+  - motion_anchor_ori_b
+  - command_z
+
+SMPL encoder 输入包括：
+
+  - smpl_joints_multi_future_local_nonflat
+  - smpl_root_ori_b_multi_future
+  - joint_pos_multi_future_wrist_for_smpl
+
+结论：
+
+  不能因为配置名里有 noz 就认为 SONIC release 去掉了 z。实际 release 链路里
+  G1 和 teleop token 都显式使用 z 相关 command。
+
+
+================================================================================
+3. SONIC release 的 motion 来源和数据增强更宽
+================================================================================
+
+release 配置使用两类 motion source：
+
+  - robot motion:
+      data/motion_lib_bones_seed/robot_filtered
+
+  - SMPL motion:
+      data/bones_seed_smpl
+
+并启用以下 reference augmentation：
+
+  - cat_upper_body_poses: true
+  - cat_upper_body_poses_prob: 0.5
+  - freeze_frame_aug: true
+  - teleop_sample_prob_when_smpl: 0.5
+  - upper_body_augment_prefixes 覆盖 walking、running、squatting、balance、2025 等前缀
+
+TextOpTracker 也有一些相近机制，例如 freeze-frame augmentation、adaptive sampling、
+基于 npz 的 motion window/latent。但当前 TextOpTracker 主要还是围绕 G1 npz clip
+和外部 VAE latent，并没有同时训练 G1/teleop/SMPL 三路 encoder 的统一 token space。
+
+
+================================================================================
+4. Reward 和 termination：SONIC release 更强调完整 tracking failure
+================================================================================
+
+SONIC release reward stack：
+
+  - tracking_anchor_pos
+  - tracking_anchor_ori
+  - tracking_relative_body_pos
+  - tracking_relative_body_ori
+  - tracking_body_linvel
+  - tracking_body_angvel
+  - action_rate_l2
+  - joint_limit
+  - undesired_contacts
+  - anti_shake_ang_vel
+  - tracking_vr_5point_local
+  - feet_acc
+
+release 配置里 reward point body：
+
+  - torso_link
+  - left_wrist_yaw_link
+  - right_wrist_yaw_link
+
+其中 torso 有 z 方向 +0.5m offset。
+
+termination stack：
+
+  - anchor_pos_adaptive
+  - anchor_ori_full
+  - ee_body_pos_adaptive
+  - motion_time_out
+  - foot_pos_xyz
+
+release override 后的主要阈值：
+
+  - anchor_pos: 0.15
+  - ee_body_pos: 0.15
+  - anchor_ori_full: 0.2
+  - foot_pos_xyz: 0.2
+
+TextOpTracker 当前 TrackingEnvCfg 中也有 tracking-error termination：
+
+  - time_out: Isaac Lab env timeout
+  - anchor_pos: bad_anchor_pos_z_only, threshold 0.25
+  - anchor_ori: bad_anchor_ori, threshold 0.8
+  - ee_body_pos: bad_motion_body_pos_z_only, threshold 0.25
+
+差异：
+
+  SONIC release 的 tracking failure 更严格，且更关心完整 anchor/EE/foot/orientation
+  误差；TextOpTracker 默认项里有更多 z-only 检查。实际训练中，如果 TextOp reward
+  看起来不错但机器人水平漂移、脚点漂移或朝向漂移明显，需要优先检查 termination
+  维度是否过松，而不是只看 reward。
+
+
+================================================================================
+5. 关于 mean_episode_length：配置意图和你实际观察到的现象矛盾
+================================================================================
+
+你观察到：
+
+  - 训练时 mean_episode_length 会超过 10000
+
+这很关键。按 release 配置链的“意图”，这不应该发生：
+
+  - manager_env/base_env.yaml:
+      episode_length_s: 10.0
+      decimation: 4
+      sim_dt: 0.005
+
+  - ModularTrackingEnvCfg.override_settings():
+      self.episode_length_s = config.get("episode_length_s", 10.0)
+      self.decimation = config.get("decimation", 4)
+      self.sim.dt = config.get("sim_dt", 0.005)
+
+如果这些设置真的被 Isaac Lab ManagerBasedRLEnv 使用，则 policy control dt 为：
+
+  - 0.005 * 4 = 0.02 s
+
+10 秒 episode 对应：
+
+  - 10.0 / 0.02 = 500 policy steps
+
+因此：
+
+  - mean_episode_length 接近 500 是合理的。
+  - 少于 500 表示有 tracking failure 提前终止。
+  - 明显超过 500，尤其超过 10000，说明 timeout / done 没有按预期进入 trainer。
+
+所以需要修正我之前的判断：
+
+  SONIC release 配置里确实写了 episode_length_s=10.0，也有 motion_time_out。
+  但如果你的训练日志里 objective/length 或 mean_episode_length 超过 10000，
+  那就不是“正常地接近 timeout”，而是实际 run 中 episode timeout 没生效，或者
+  trainer 没有收到 timeout 产生的 done。
+
+
+================================================================================
+6. mean_episode_length 在 gear_sonic trainer 里是怎么来的
+================================================================================
+
+代码位置：
+
+  - /data/yzh/GR00T-WholeBodyControl/gear_sonic/trl/trainer/ppo_trainer.py
+
+关键逻辑：
+
+  - cur_episode_length 初始化为每个 env 一个 0。
+  - 每 step 执行：
+      cur_episode_length += 1
+  - 只有当 dones > 0 时：
+      lenbuffer 加入对应 env 的 cur_episode_length
+      对应 env 的 cur_episode_length 清零
+  - 日志：
+      metrics["objective/length"] = mean(lenbuffer)
+
+因此 objective/length 依赖一个前提：
+
+  env.step() 必须返回正确的 dones。
+
+wrapper 代码位置：
+
+  - /data/yzh/GR00T-WholeBodyControl/gear_sonic/envs/wrapper/manager_env_wrapper.py
+
+关键逻辑：
+
+  - obs_dict, rew, terminated, truncated, extras = self.env.step(env_actions)
+  - dones = terminated | truncated
+  - extras["time_outs"] = truncated
+
+所以如果 mean_episode_length 能超过 10000，最直接的解释是：
+
+  - terminated 基本没触发；
+  - truncated 也基本没触发；
+  - trainer 的 cur_episode_length 没机会清零。
+
+
+================================================================================
+7. 为什么 motion_time_out 也可能没救住这个问题
+================================================================================
+
+SONIC release termination 里有：
+
+  - motion_time_out
+
+对应配置：
+
+  - /data/yzh/GR00T-WholeBodyControl/gear_sonic/config/manager_env/terminations/terms/motion_time_out.yaml
+
+内容是：
+
+  - func: gear_sonic.envs.manager_env.mdp:tracking_time_out
+  - time_out: true
+  - command_name: motion
+
+tracking_time_out 的逻辑：
+
+  - elapsed = command.time_steps + command.motion_start_time_steps + 1
+  - total = command.motion_lib.get_time_step_total(command.motion_ids)
+  - return elapsed >= total
+
+如果 motion clip 本身很长，比如几个小时的数据被作为一个连续 motion id，那么
+motion_time_out 不会在 500 step 左右触发，它会等 motion 本身播完。
+
+这时本来应该由 Isaac Lab 的 env episode_length_s 触发 truncated。但你的日志显示
+超过 10000，说明 env-level truncated 很可能没有生效，或者没有被 wrapper/trainer
+正确使用。
+
+
+================================================================================
+8. 最可能的 bug / 配置问题
+================================================================================
+
+按当前代码路径，优先怀疑以下几类问题：
+
+1. 实际启动的 composed config 不是 sonic_release.yaml 这条链
+
+   需要确认训练输出目录里的 .hydra/config.yaml 或 resolved config 中确实有：
+
+     manager_env:
+       config:
+         episode_length_s: 10.0
+         decimation: 4
+         sim_dt: 0.005
+
+2. ModularTrackingEnvCfg 设置了 self.episode_length_s，但 Isaac Lab 没有据此产生 truncated
+
+   需要在运行时打印：
+
+     env.unwrapped.max_episode_length
+     env.unwrapped.max_episode_length_s
+     env.unwrapped.episode_length_buf.max()
+     truncated.sum()
+
+   如果 max_episode_length 不是 500，说明 cfg 没有被正确应用。
+   如果 max_episode_length 是 500 但 truncated.sum() 一直是 0，说明 env timeout manager
+   或 reset/step 链路有问题。
+
+3. motion_time_out 的 total 太长
+
+   对长 motion 来说，这不是 bug。motion_time_out 是“motion 播完”，不是“10 秒截断”。
+   10 秒上限应该来自 env-level episode_length_s。
+
+4. trainer 的 objective/length 只依赖 dones
+
+   如果 env 没有 done，cur_episode_length 会无限累加。这个指标本身没有二次保护。
+
+
+================================================================================
+9. 建议加的最小调试打印
+================================================================================
+
+建议先不要直接改训练逻辑，先确认 timeout 是否进了 wrapper。
+
+可以在：
+
+  - /data/yzh/GR00T-WholeBodyControl/gear_sonic/envs/wrapper/manager_env_wrapper.py
+
+`obs_dict, rew, terminated, truncated, extras = self.env.step(env_actions)` 后面临时加：
+
+  if not hasattr(self, "_debug_timeout_counter"):
+      self._debug_timeout_counter = 0
+  self._debug_timeout_counter += 1
+  if self._debug_timeout_counter % 100 == 0:
+      print(
+          "[timeout-debug]",
+          "step", self._debug_timeout_counter,
+          "terminated", int(terminated.sum()),
+          "truncated", int(truncated.sum()),
+          "dones", int((terminated | truncated).sum()),
+          "max_ep_len", getattr(self.env, "max_episode_length", None),
+          "max_ep_len_s", getattr(self.env, "max_episode_length_s", None),
+          "ep_buf_max", int(getattr(self.env, "episode_length_buf").max()),
+      )
+
+预期：
+
+  - max_ep_len 应该大约是 500。
+  - ep_buf_max 到 500 左右时，truncated 应该大于 0。
+  - 如果 ep_buf_max 超过 500 还没有 truncated，说明 env timeout 没启动。
+
+
+================================================================================
+10. 如果确认是 timeout 没生效，建议修复方向
+================================================================================
+
+优先修复方向：
+
+  1. 确保 composed config 里 manager_env.config.episode_length_s 是 10.0。
+
+  2. 确认 ModularTrackingEnvCfg.override_settings() 在 ManagerBasedRLEnv 创建前已执行。
+
+  3. 如果 Isaac Lab 版本没有自动使用 episode_length_s 产生 truncated，可以在 wrapper
+     里加一个保底 timeout，但这属于行为改动，需要谨慎：
+
+       timeout_by_len = self.env.episode_length_buf >= self.env.max_episode_length
+       truncated = truncated | timeout_by_len
+       dones = terminated | truncated
+
+     这个修复要先验证 `max_episode_length` 是否存在且数值正确。
+
+  4. 不建议直接在 trainer 里用 cur_episode_length > 500 强行清零。那会绕过 env reset，
+     policy hidden state / command state / simulation state 可能不同步。
+
+
+================================================================================
+11. 不应该限制 mean_episode_length 本身
+================================================================================
+
+这里要区分两个问题：
+
+  - 问题 A：mean_episode_length 是否应该作为优化目标或约束？
+  - 问题 B：episode timeout 是否真的生效？
+
+答案：
+
+  - A：不应该限制 mean_episode_length 本身。
+  - B：应该修复 timeout / done，使单个 env episode 正常结束。
+
+如果 timeout 正常，mean_episode_length 是一个有意义的诊断指标：
+
+  - 很低：tracking failure 很多。
+  - 接近 500：策略能活到 10 秒 timeout 或 motion end。
+  - 超过 500：当前配置下异常，需要查 timeout/done。
+
+所以正确处理不是“加一个 mean_episode_length cap”，而是：
+
+  - 让 env timeout 正确地产生 truncated；
+  - 让 wrapper 正确把 truncated 合入 dones；
+  - 让 trainer 在 dones 时清零 cur_episode_length。
+
+
+================================================================================
+12. PPO / optimization 额外差异
+================================================================================
+
+SONIC release 的 PPO / actor 优化更保守：
+
+  - actor learning rate: 2e-5
+  - critic learning rate: 1e-3
+  - entropy_coef: 0.01
+  - init_noise_std: 0.05
+  - use_clampped_std: true
+  - std clamp: 0.001 到 0.5
+  - max_grad_norm: 0.1
+  - adaptive_lr_min: 1e-5
+  - adaptive_lr_max: 2e-4
+  - sync_advantage_normalization: true
+  - ppo_shuffle_every_epoch: true
+  - num_steps_per_env: 24
+
+TextOpTracker / rsl_rl 配置通常更接近常规 PPO：
+
+  - actor/critic 常用共享 lr；
+  - 初始 action std 更大；
+  - 没有 online universal-token aux loss；
+  - 没有 PPO actor 内部 FSQ token bottleneck。
+
+实际影响：
+
+  SONIC release 不靠激进 actor 更新，而是靠低 actor LR、std clamp、aux loss、
+  multi-interface token structure 来稳定训练。
+
+
+================================================================================
+13. Adaptive sampling 差异
+================================================================================
+
+SONIC release：
+
+  - adaptive_sampling.adp_samp_failure_rate_max_over_mean: 200
+
+这个值比之前 G1-only 对比里更激进，允许 hard motion 的采样权重明显高于平均 motion。
+
+TextOpTracker commands_multi 里也统计 failed/success motion 并构造 p_fail 分布，但具体
+bookkeeping 和 sampling knob 不一样。
+
+这里和 mean_episode_length 的关系：
+
+  adaptive sampling 应该基于真实 failure / success / timeout。如果 timeout 没生效，
+  success/failure 统计也会被污染；如果人为限制 mean_episode_length，同样会污染
+  motion 难度估计。
+
+
+================================================================================
+14. 对 TextOpTracker 值得借鉴和不该照抄的点
+================================================================================
+
+值得借鉴：
+
+  - 把 episode length 当诊断指标，而不是训练目标。
+  - 分开记录 termination reason：timeout、motion end、anchor fail、ori fail、
+    EE fail、foot fail。
+  - 如果姿态漂移明显，考虑从 z-only termination 升级到完整 xyz / orientation 检查。
+  - actor LR 可以更小，actor/critic LR 可以拆开。
+  - action std 建议有 clamp，避免探索噪声失控。
+  - 如果 latent 在线训练，可以加 reconstruction/alignment aux loss。
+
+不该照抄：
+
+  - 不要直接给 mean_episode_length 加 cap。
+  - 不要在 trainer 里硬清零 episode length 来假装 reset。
+  - 不要复制 SONIC 的 G1/teleop/SMPL latent alignment loss，除非 TextOp 也有对应
+    三路 encoder 和数据源。
+  - 不要因为 unitoken_all_noz 的名字就认为 release 配置去掉了 z。
+
+
+================================================================================
+15. 代码位置索引
+================================================================================
+
+SONIC release config:
+
+  - /data/yzh/GR00T-WholeBodyControl/gear_sonic/config/exp/manager/universal_token/all_modes/sonic_release.yaml
+
+SONIC base env:
+
+  - /data/yzh/GR00T-WholeBodyControl/gear_sonic/config/manager_env/base_env.yaml
+
+SONIC env cfg:
+
+  - /data/yzh/GR00T-WholeBodyControl/gear_sonic/envs/manager_env/modular_tracking_env_cfg.py
+
+SONIC wrapper done/time_out:
+
+  - /data/yzh/GR00T-WholeBodyControl/gear_sonic/envs/wrapper/manager_env_wrapper.py
+
+SONIC PPO objective/length:
+
+  - /data/yzh/GR00T-WholeBodyControl/gear_sonic/trl/trainer/ppo_trainer.py
+
+SONIC tokenizer:
+
+  - /data/yzh/GR00T-WholeBodyControl/gear_sonic/config/manager_env/observations/tokenizer/unitoken_all_noz.yaml
+
+SONIC aux losses:
+
+  - /data/yzh/GR00T-WholeBodyControl/gear_sonic/config/aux_losses/universal_token/g1_recon_and_all_latent.yaml
+
+SONIC motion_time_out:
+
+  - /data/yzh/GR00T-WholeBodyControl/gear_sonic/config/manager_env/terminations/terms/motion_time_out.yaml
+  - /data/yzh/GR00T-WholeBodyControl/gear_sonic/envs/manager_env/mdp/terminations.py
+
+TextOpTracker termination / episode length:
+
+  - /data/yzh/TextOp/TextOpTracker/source/textop_tracker/textop_tracker/tasks/tracking/tracking_env_cfg.py
+
+TextOpTracker adaptive sampling:
+
+  - /data/yzh/TextOp/TextOpTracker/source/textop_tracker/textop_tracker/tasks/tracking/mdp/commands_multi.py

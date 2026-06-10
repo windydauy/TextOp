@@ -833,6 +833,47 @@ class MotionCommand(CommandTerm):
         self.metrics["sampling_top1_prob"][:] = pmax
         self.metrics["sampling_top1_bin"][:] = imax.float() / self.bin_count
 
+    def _apply_max_prob_over_uniform(self, probabilities: torch.Tensor) -> torch.Tensor:
+        max_prob_over_uniform = self.cfg.max_prob_over_uniform
+        if max_prob_over_uniform <= 0:
+            return probabilities
+
+        num_motion = int(probabilities.numel())
+        max_prob = float(max_prob_over_uniform) / float(num_motion)
+        uniform_prob = 1.0 / float(num_motion)
+        if max_prob < uniform_prob:
+            raise ValueError(
+                "max_prob_over_uniform must be >= 1.0 because probabilities must sum to 1, "
+                f"got {max_prob_over_uniform}"
+            )
+        if max_prob >= 1.0:
+            return probabilities
+
+        probs = probabilities.double()
+        sorted_probs, sorted_idx = torch.sort(probs, descending=True)
+        prefix_before = torch.cat(
+            [sorted_probs.new_zeros(1), sorted_probs.cumsum(dim=0)[:-1]]
+        )
+        capped_counts = torch.arange(num_motion, device=probs.device, dtype=probs.dtype)
+        remaining_mass = 1.0 - capped_counts * max_prob
+        remaining_base = torch.clamp(1.0 - prefix_before, min=1e-12)
+        scales = remaining_mass / remaining_base
+        valid = (remaining_mass >= 0.0) & (sorted_probs * scales <= max_prob + 1e-12)
+        if torch.any(valid):
+            capped_count = int(torch.nonzero(valid, as_tuple=False)[0].item())
+            scale = scales[capped_count]
+            capped_sorted = sorted_probs.clone()
+            if capped_count > 0:
+                capped_sorted[:capped_count] = max_prob
+            capped_sorted[capped_count:] = sorted_probs[capped_count:] * scale
+        else:
+            capped_sorted = torch.full_like(sorted_probs, uniform_prob)
+
+        capped = torch.empty_like(capped_sorted)
+        capped[sorted_idx] = capped_sorted
+        capped = capped / capped.sum().clamp_min(1e-12)
+        return capped.to(dtype=probabilities.dtype)
+
     def _adaptive_sampling(self, env_ids: torch.Tensor) -> torch.Tensor:
         episode_failed: torch.Tensor = self._env.termination_manager.terminated[
             env_ids]  # type:ignore
@@ -888,6 +929,9 @@ class MotionCommand(CommandTerm):
         else:
             raise ValueError(
                 f"Unsupported adaptive sampling type: {self.cfg.ads_type}")
+
+        sampling_probabilities = self._apply_max_prob_over_uniform(
+            sampling_probabilities)
 
         # 根据概率进行采样
         sampled_motion_ids = torch.multinomial(sampling_probabilities,
@@ -1241,6 +1285,7 @@ class MotionCommandCfg(CommandTermCfg):
     adaptive_uniform_ratio: float = 0.1
     adaptive_alpha: float = 0.001
     adaptive_beta: float = 0.5
+    max_prob_over_uniform: float = 0.0
 
     # Random Static
     random_static_prob: float = -1.0

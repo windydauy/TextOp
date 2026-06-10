@@ -11,6 +11,45 @@ from isaaclab_rl.rsl_rl import export_policy_as_onnx
 import wandb
 from textop_tracker.utils.exporter import attach_onnx_metadata, export_motion_policy_as_onnx
 
+
+def _cap_probabilities_over_uniform(probabilities, max_prob_over_uniform):
+    if max_prob_over_uniform is None or max_prob_over_uniform <= 0:
+        return probabilities
+    probabilities = np.asarray(probabilities, dtype=np.float64)
+    num_items = probabilities.size
+    max_prob = float(max_prob_over_uniform) / float(num_items)
+    uniform_prob = 1.0 / float(num_items)
+    if max_prob < uniform_prob:
+        raise ValueError(
+            "max_prob_over_uniform must be >= 1.0 because probabilities must sum to 1, "
+            f"got {max_prob_over_uniform}"
+        )
+    if max_prob >= 1.0:
+        return probabilities.astype(np.float32)
+
+    order = np.argsort(-probabilities)
+    sorted_probs = probabilities[order]
+    prefix_before = np.concatenate([[0.0], np.cumsum(sorted_probs)[:-1]])
+    capped_counts = np.arange(num_items, dtype=np.float64)
+    remaining_mass = 1.0 - capped_counts * max_prob
+    remaining_base = np.maximum(1.0 - prefix_before, 1e-12)
+    scales = remaining_mass / remaining_base
+    valid = (remaining_mass >= 0.0) & (sorted_probs * scales <= max_prob + 1e-12)
+    if np.any(valid):
+        capped_count = int(np.flatnonzero(valid)[0])
+        capped_sorted = sorted_probs.copy()
+        if capped_count > 0:
+            capped_sorted[:capped_count] = max_prob
+        capped_sorted[capped_count:] = sorted_probs[capped_count:] * scales[capped_count]
+    else:
+        capped_sorted = np.full_like(sorted_probs, uniform_prob)
+
+    capped = np.empty_like(capped_sorted)
+    capped[order] = capped_sorted
+    capped = capped / max(capped.sum(), 1e-12)
+    return capped.astype(np.float32)
+
+
 # class MyOnPolicyRunner(OnPolicyRunner):
 #     def save(self, path: str, infos=None):
 #         """Save the model and training information."""
@@ -67,12 +106,17 @@ class MotionOnPolicyRunner(OnPolicyRunner):
                 unwrapped_env.command_manager.get_term("motion").cfg.adaptive_uniform_ratio /
                 float(unwrapped_env.command_manager.get_term("motion").num_motion)
             )
+            max_prob_over_uniform = unwrapped_env.command_manager.get_term("motion").cfg.max_prob_over_uniform
+            sampling_probabilities_v2_capped = _cap_probabilities_over_uniform(
+                sampling_probabilities_v2, max_prob_over_uniform)
             adpsam_count = {
                 "failed_motion_count": fail_count,
                 "success_motion_count": success_count,
                 "p_fail": p_fail,
                 "p_fail_sample_v2": p_fail_sample_v2,
                 "sampling_probabilities_v2": sampling_probabilities_v2,
+                "max_prob_over_uniform": max_prob_over_uniform,
+                "sampling_probabilities_v2_capped": sampling_probabilities_v2_capped,
             }
             # (adpsam_count, step=self.current_learning_iteration)
             pickle.dump(adpsam_count, open(path[:-len(".pt")] + "-adpsam_count.pkl", "wb"))
