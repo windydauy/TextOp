@@ -46,29 +46,41 @@ def robot_anchor_ang_vel_w(env: ManagerBasedEnv, command_name: str) -> torch.Ten
     return command.robot_anchor_vel_w[:, 3:6].view(env.num_envs, -1)
 
 
-def robot_body_pos_b(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
+def robot_body_pos_b(
+    env: ManagerBasedEnv,
+    command_name: str,
+    body_names: list[str] | None = None,
+) -> torch.Tensor:
     command: MotionCommand = env.command_manager.get_term(command_name)
 
-    num_bodies = len(command.cfg.body_names)
+    selected_body_names = body_names or command.cfg.body_names
+    body_indexes = [command.cfg.body_names.index(n) for n in selected_body_names]
+    num_bodies = len(body_indexes)
     pos_b, _ = subtract_frame_transforms(
         command.robot_anchor_pos_w[:, None, :].repeat(1, num_bodies, 1),
         command.robot_anchor_quat_w[:, None, :].repeat(1, num_bodies, 1),
-        command.robot_body_pos_w,
-        command.robot_body_quat_w,
+        command.robot_body_pos_w[:, body_indexes],
+        command.robot_body_quat_w[:, body_indexes],
     )
 
     return pos_b.view(env.num_envs, -1)
 
 
-def robot_body_ori_b(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
+def robot_body_ori_b(
+    env: ManagerBasedEnv,
+    command_name: str,
+    body_names: list[str] | None = None,
+) -> torch.Tensor:
     command: MotionCommand = env.command_manager.get_term(command_name)
 
-    num_bodies = len(command.cfg.body_names)
+    selected_body_names = body_names or command.cfg.body_names
+    body_indexes = [command.cfg.body_names.index(n) for n in selected_body_names]
+    num_bodies = len(body_indexes)
     _, ori_b = subtract_frame_transforms(
         command.robot_anchor_pos_w[:, None, :].repeat(1, num_bodies, 1),
         command.robot_anchor_quat_w[:, None, :].repeat(1, num_bodies, 1),
-        command.robot_body_pos_w,
-        command.robot_body_quat_w,
+        command.robot_body_pos_w[:, body_indexes],
+        command.robot_body_quat_w[:, body_indexes],
     )
     mat = matrix_from_quat(ori_b)
     return mat[..., :2].reshape(mat.shape[0], -1)

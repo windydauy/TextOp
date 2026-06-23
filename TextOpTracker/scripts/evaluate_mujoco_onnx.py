@@ -176,6 +176,7 @@ def make_latent_adapters(task: str, args: argparse.Namespace):
     elif task in (
         dm.TASK_PROJ_GRAV_ANCHOR_OBS_TRANSFORMER_VAE,
         dm.TASK_PROJ_GRAV_ANCHOR_EE_OBS_TRANSFORMER_VAE,
+        dm.TASK_PROJ_GRAV_ANCHOR_EE_OBS_ONESTEP_TRANSFORMER_VAE,
     ):
         motion_transformer_vae_adapter = dm.MotionTransformerVAEOnnxLatentAdapter(
             project_root=args.motion_transformer_vae_project_root,

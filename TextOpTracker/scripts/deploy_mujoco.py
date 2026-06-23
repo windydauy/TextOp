@@ -2,8 +2,11 @@ import glob
 import re
 import sys
 import time
-import mujoco, mujoco_viewer, mujoco.viewer
-# `$ pip install mujoco-python-viewer` If `mujoco_viewer` not found.
+import mujoco, mujoco.viewer
+try:
+    import mujoco_viewer
+except ModuleNotFoundError:
+    mujoco_viewer = None
 import numpy as np
 import torch
 import argparse
@@ -100,6 +103,8 @@ ANCHOR_ORI_DIM_PER_STEP = 6
 PROJECTED_GRAVITY_DIM = 3
 ROBOT_ANCHOR_POS_DIM = 3
 ROBOT_ANCHOR_ORI_DIM = 6
+ROBOT_EE_POS_DIM = 4 * 3
+ROBOT_EE_ORI_DIM = 4 * 6
 BASE_LIN_VEL_DIM = 3
 BASE_ANG_VEL_DIM = 3
 JOINT_POS_DIM = NUM_ACTIONS
@@ -113,6 +118,12 @@ TASK_PROJ_GRAV_ANCHOR_OBS_MOTION_AE = "Tracking-Flat-G1-ProjGravAnchorObs-Motion
 TASK_PROJ_GRAV_ANCHOR_EE_OBS = "Tracking-Flat-G1-ProjGravAnchorEEObs-NMMLP-v0"
 TASK_PROJ_GRAV_ANCHOR_OBS_TRANSFORMER_VAE = "Tracking-Flat-G1-ProjGravAnchorObs-TransformerVAE-NMMLP-v0"
 TASK_PROJ_GRAV_ANCHOR_EE_OBS_TRANSFORMER_VAE = "Tracking-Flat-G1-ProjGravAnchorEEObs-TransformerVAE-NMMLP-v0"
+TASK_PROJ_GRAV_ANCHOR_EE_OBS_ONESTEP_TRANSFORMER_VAE = (
+    "Tracking-Flat-G1-ProjGravAnchorEEObsOneStep-TransformerVAE-NMMLP-v0"
+)
+TASK_PROJ_GRAV_ANCHOR_EE_REL_OBS_ONESTEP_TRANSFORMER_VAE = (
+    "Tracking-Flat-G1-ProjGravAnchorEERelObsOneStep-TransformerVAE-NMMLP-v0"
+)
 TASK_PROJ_GRAV_ANCHOR_EE_OBS_DIRECT_REF_MOTION = (
     "Tracking-Flat-G1-ProjGravAnchorEEObs-DirectRefMotion-NMMLP-v0"
 )
@@ -123,6 +134,8 @@ SUPPORTED_TASKS = (
     TASK_PROJ_GRAV_ANCHOR_EE_OBS,
     TASK_PROJ_GRAV_ANCHOR_OBS_TRANSFORMER_VAE,
     TASK_PROJ_GRAV_ANCHOR_EE_OBS_TRANSFORMER_VAE,
+    TASK_PROJ_GRAV_ANCHOR_EE_OBS_ONESTEP_TRANSFORMER_VAE,
+    TASK_PROJ_GRAV_ANCHOR_EE_REL_OBS_ONESTEP_TRANSFORMER_VAE,
     TASK_PROJ_GRAV_ANCHOR_EE_OBS_DIRECT_REF_MOTION,
 )
 
@@ -165,6 +178,20 @@ PROJ_GRAV_ANCHOR_EE_OBS_TERMS = (
     "motion_ee_pos_b",
     "motion_ee_ori_b",
 )
+PROJ_GRAV_ANCHOR_EE_REL_OBS_TERMS = (
+    "command",
+    "motion_anchor_pos_b",
+    "motion_anchor_ori_b",
+    "motion_ee_pos_b",
+    "motion_ee_ori_b",
+    "robot_ee_pos_b",
+    "robot_ee_ori_b",
+    "projected_gravity",
+    "base_ang_vel",
+    "joint_pos",
+    "joint_vel",
+    "actions",
+)
 TASK_OBSERVATION_TERMS = {
     TASK_PROJ_GRAV_OBS: PROJ_GRAV_OBS_TERMS,
     TASK_PROJ_GRAV_ANCHOR_OBS: PROJ_GRAV_ANCHOR_OBS_TERMS,
@@ -172,6 +199,8 @@ TASK_OBSERVATION_TERMS = {
     TASK_PROJ_GRAV_ANCHOR_EE_OBS: PROJ_GRAV_ANCHOR_EE_OBS_TERMS,
     TASK_PROJ_GRAV_ANCHOR_OBS_TRANSFORMER_VAE: PROJ_GRAV_ANCHOR_OBS_TERMS,
     TASK_PROJ_GRAV_ANCHOR_EE_OBS_TRANSFORMER_VAE: PROJ_GRAV_ANCHOR_EE_OBS_TERMS,
+    TASK_PROJ_GRAV_ANCHOR_EE_OBS_ONESTEP_TRANSFORMER_VAE: PROJ_GRAV_ANCHOR_EE_OBS_TERMS,
+    TASK_PROJ_GRAV_ANCHOR_EE_REL_OBS_ONESTEP_TRANSFORMER_VAE: PROJ_GRAV_ANCHOR_EE_REL_OBS_TERMS,
     TASK_PROJ_GRAV_ANCHOR_EE_OBS_DIRECT_REF_MOTION: PROJ_GRAV_ANCHOR_EE_OBS_TERMS,
 }
 FUTURE_TERM_DIMS = {
@@ -184,12 +213,18 @@ FIXED_TERM_DIMS = {
     "projected_gravity": PROJECTED_GRAVITY_DIM,
     "robot_anchor_pos_w": ROBOT_ANCHOR_POS_DIM,
     "robot_anchor_ori_w": ROBOT_ANCHOR_ORI_DIM,
+    "robot_ee_pos_b": ROBOT_EE_POS_DIM,
+    "robot_ee_ori_b": ROBOT_EE_ORI_DIM,
     "base_lin_vel": BASE_LIN_VEL_DIM,
     "base_ang_vel": BASE_ANG_VEL_DIM,
     "joint_pos": JOINT_POS_DIM,
     "joint_vel": JOINT_VEL_DIM,
     "actions": LAST_ACTION_DIM,
 }
+ONE_STEP_FUTURE_TASKS = (
+    TASK_PROJ_GRAV_ANCHOR_EE_OBS_ONESTEP_TRANSFORMER_VAE,
+    TASK_PROJ_GRAV_ANCHOR_EE_REL_OBS_ONESTEP_TRANSFORMER_VAE,
+)
 
 DEFAULT_MOTION_AE_PROJECT_ROOT = "/home/humanoid/yzh/TextOp/motion_ae"
 DEFAULT_MOTION_AE_RUN_DIR = (
@@ -548,15 +583,19 @@ def _candidate_tasks_from_observation_names(observation_names):
             TASK_PROJ_GRAV_ANCHOR_EE_OBS,
             TASK_PROJ_GRAV_ANCHOR_OBS_TRANSFORMER_VAE,
             TASK_PROJ_GRAV_ANCHOR_EE_OBS_TRANSFORMER_VAE,
+            TASK_PROJ_GRAV_ANCHOR_EE_OBS_ONESTEP_TRANSFORMER_VAE,
             TASK_PROJ_GRAV_ANCHOR_EE_OBS_DIRECT_REF_MOTION,
         ]
         if "motion_ee_pos_b" in names or "motion_ee_ori_b" in names:
             return [
                 TASK_PROJ_GRAV_ANCHOR_EE_OBS,
                 TASK_PROJ_GRAV_ANCHOR_EE_OBS_TRANSFORMER_VAE,
+                TASK_PROJ_GRAV_ANCHOR_EE_OBS_ONESTEP_TRANSFORMER_VAE,
                 TASK_PROJ_GRAV_ANCHOR_EE_OBS_DIRECT_REF_MOTION,
             ]
         return candidates
+    if "robot_ee_pos_b" in names or "robot_ee_ori_b" in names:
+        return [TASK_PROJ_GRAV_ANCHOR_EE_REL_OBS_ONESTEP_TRANSFORMER_VAE]
     if "projected_gravity" in names:
         return [TASK_PROJ_GRAV_OBS]
     return []
@@ -585,6 +624,8 @@ def infer_task_from_observation_names(observation_names, input_dim=None, future_
 def task_from_obs_config(obs_config):
     if obs_config in TASK_OBSERVATION_TERMS:
         return obs_config
+    if "EERelObs" in obs_config:
+        return TASK_PROJ_GRAV_ANCHOR_EE_REL_OBS_ONESTEP_TRANSFORMER_VAE
     if "EEObs" in obs_config:
         return TASK_PROJ_GRAV_ANCHOR_EE_OBS
     if _uses_robot_anchor_obs(obs_config):
@@ -632,12 +673,20 @@ def _term_dims(observation_terms, task=None):
         if term == "command":
             if task in (TASK_PROJ_GRAV_ANCHOR_OBS_MOTION_AE, TASK_PROJ_GRAV_ANCHOR_EE_OBS):
                 fixed_dim += MOTION_AE_LATENT_DIM
-            elif task in (TASK_PROJ_GRAV_ANCHOR_OBS_TRANSFORMER_VAE, TASK_PROJ_GRAV_ANCHOR_EE_OBS_TRANSFORMER_VAE):
+            elif task in (
+                TASK_PROJ_GRAV_ANCHOR_OBS_TRANSFORMER_VAE,
+                TASK_PROJ_GRAV_ANCHOR_EE_OBS_TRANSFORMER_VAE,
+                TASK_PROJ_GRAV_ANCHOR_EE_OBS_ONESTEP_TRANSFORMER_VAE,
+                TASK_PROJ_GRAV_ANCHOR_EE_REL_OBS_ONESTEP_TRANSFORMER_VAE,
+            ):
                 fixed_dim += MOTION_TRANSFORMER_VAE_LATENT_DIM
             else:
                 per_step_dim += COMMAND_DIM_PER_STEP
         elif term in FUTURE_TERM_DIMS:
-            per_step_dim += FUTURE_TERM_DIMS[term]
+            if task in ONE_STEP_FUTURE_TASKS:
+                fixed_dim += FUTURE_TERM_DIMS[term]
+            else:
+                per_step_dim += FUTURE_TERM_DIMS[term]
         elif term in FIXED_TERM_DIMS:
             fixed_dim += FIXED_TERM_DIMS[term]
         else:
@@ -656,6 +705,13 @@ def infer_future_steps_from_input_dim(input_dim, obs_config="ProjGravObs", task=
         return None
     terms = get_observation_terms(task=task, obs_config=obs_config, observation_terms=observation_terms)
     fixed_dim, per_step_dim = _term_dims(terms, task=task)
+    if per_step_dim == 0:
+        if input_dim == fixed_dim:
+            return 1
+        raise ValueError(
+            f"Cannot infer future_steps from ONNX input dim {input_dim} with task={task}, obs_config={obs_config}. "
+            f"Expected fixed dim={fixed_dim}."
+        )
     remainder = input_dim - fixed_dim
     if remainder <= 0 or remainder % per_step_dim != 0:
         raise ValueError(
@@ -1046,10 +1102,11 @@ def get_command(motion_loader, t):
     return cmd  # [290]
 
 
-def motion_anchor_pos_b_future(sim_data, motion_loader, t):
+def motion_anchor_pos_b_future(sim_data, motion_loader, t, future_steps=None):
     """Future N-step motion anchor position in body frame - matching Isaac Lab order"""
+    future_steps = motion_loader.future_steps if future_steps is None else int(future_steps)
     if t < 0:
-        return np.zeros(motion_loader.future_steps * ANCHOR_POS_DIM_PER_STEP, dtype=np.float32)
+        return np.zeros(future_steps * ANCHOR_POS_DIM_PER_STEP, dtype=np.float32)
 
     # Get robot anchor pose
     robot_pos = sim_data.body(motion_loader.anchor_body_name).xpos.copy().reshape(1, 3)
@@ -1058,7 +1115,7 @@ def motion_anchor_pos_b_future(sim_data, motion_loader, t):
     # Get future motion anchor poses - batch process like Isaac Lab
     future_positions = []
     future_orientations = []
-    for i in range(motion_loader.future_steps):
+    for i in range(future_steps):
         step_idx = min(t + i, motion_loader.T - 1)
         ref_pos = motion_loader.body_pos[step_idx][motion_loader.anchor_body_index].reshape(1, 3)
         ref_quat = motion_loader.body_ori[step_idx][motion_loader.anchor_body_index].reshape(1, 4)
@@ -1070,8 +1127,8 @@ def motion_anchor_pos_b_future(sim_data, motion_loader, t):
     future_anchor_quat_w = np.stack(future_orientations, axis=0).squeeze(1)  # [5, 4]
 
     # Expand robot anchor for broadcasting: [future_steps, 3] and [future_steps, 4]
-    robot_anchor_pos_w_exp = robot_pos.repeat(motion_loader.future_steps, axis=0)  # [5, 3]
-    robot_anchor_quat_w_exp = robot_quat.repeat(motion_loader.future_steps, axis=0)  # [5, 4]
+    robot_anchor_pos_w_exp = robot_pos.repeat(future_steps, axis=0)  # [5, 3]
+    robot_anchor_quat_w_exp = robot_quat.repeat(future_steps, axis=0)  # [5, 4]
 
     # Transform all future steps at once
     pos_b, _ = subtract_frame_transforms(
@@ -1085,10 +1142,11 @@ def motion_anchor_pos_b_future(sim_data, motion_loader, t):
     return pos_b_flat  # [15]
 
 
-def motion_anchor_ori_b_future(sim_data, motion_loader, t):
+def motion_anchor_ori_b_future(sim_data, motion_loader, t, future_steps=None):
     """Future N-step motion anchor orientation in body frame - matching Isaac Lab order"""
+    future_steps = motion_loader.future_steps if future_steps is None else int(future_steps)
     if t < 0:
-        return np.zeros(motion_loader.future_steps * ANCHOR_ORI_DIM_PER_STEP, dtype=np.float32)
+        return np.zeros(future_steps * ANCHOR_ORI_DIM_PER_STEP, dtype=np.float32)
 
     # Get robot anchor pose
     robot_pos = sim_data.body(motion_loader.anchor_body_name).xpos.copy().reshape(1, 3)
@@ -1097,7 +1155,7 @@ def motion_anchor_ori_b_future(sim_data, motion_loader, t):
     # Get future motion anchor orientations - batch process like Isaac Lab
     future_positions = []
     future_orientations = []
-    for i in range(motion_loader.future_steps):
+    for i in range(future_steps):
         step_idx = min(t + i, motion_loader.T - 1)
         ref_pos = motion_loader.body_pos[step_idx][motion_loader.anchor_body_index].reshape(1, 3)
         ref_quat = motion_loader.body_ori[step_idx][motion_loader.anchor_body_index].reshape(1, 4)
@@ -1108,8 +1166,8 @@ def motion_anchor_ori_b_future(sim_data, motion_loader, t):
     future_anchor_quat_w = np.stack(future_orientations, axis=0).squeeze(1)  # [5, 4]
 
     # Expand robot anchor for broadcasting: [future_steps, 3] and [future_steps, 4]
-    robot_anchor_pos_w_exp = robot_pos.repeat(motion_loader.future_steps, axis=0)  # [5, 3]
-    robot_anchor_quat_w_exp = robot_quat.repeat(motion_loader.future_steps, axis=0)  # [5, 4]
+    robot_anchor_pos_w_exp = robot_pos.repeat(future_steps, axis=0)  # [5, 3]
+    robot_anchor_quat_w_exp = robot_quat.repeat(future_steps, axis=0)  # [5, 4]
 
     # Transform all future steps at once
     pos_b, ori_b = subtract_frame_transforms(
@@ -1128,10 +1186,11 @@ def motion_anchor_ori_b_future(sim_data, motion_loader, t):
     return ori_b_flat  # [30]
 
 
-def motion_body_pos_b_future(sim_data, motion_loader, t, body_names):
+def motion_body_pos_b_future(sim_data, motion_loader, t, body_names, future_steps=None):
     """Future N-step reference body positions in robot anchor frame."""
+    future_steps = motion_loader.future_steps if future_steps is None else int(future_steps)
     if t < 0:
-        return np.zeros(motion_loader.future_steps * len(body_names) * 3, dtype=np.float32)
+        return np.zeros(future_steps * len(body_names) * 3, dtype=np.float32)
 
     robot_pos = sim_data.body(motion_loader.anchor_body_name).xpos.copy().reshape(1, 1, 3)
     robot_quat = sim_data.body(motion_loader.anchor_body_name).xquat.copy().reshape(1, 1, 4)
@@ -1139,16 +1198,16 @@ def motion_body_pos_b_future(sim_data, motion_loader, t, body_names):
 
     future_positions = []
     future_orientations = []
-    for i in range(motion_loader.future_steps):
+    for i in range(future_steps):
         step_idx = min(t + i, motion_loader.T - 1)
         future_positions.append(motion_loader.body_pos[step_idx, body_indexes])
         future_orientations.append(motion_loader.body_ori[step_idx, body_indexes])
 
     future_body_pos_w = np.stack(future_positions, axis=0)
     future_body_quat_w = np.stack(future_orientations, axis=0)
-    robot_anchor_pos_w_exp = np.repeat(robot_pos, motion_loader.future_steps, axis=0)
+    robot_anchor_pos_w_exp = np.repeat(robot_pos, future_steps, axis=0)
     robot_anchor_pos_w_exp = np.repeat(robot_anchor_pos_w_exp, len(body_names), axis=1)
-    robot_anchor_quat_w_exp = np.repeat(robot_quat, motion_loader.future_steps, axis=0)
+    robot_anchor_quat_w_exp = np.repeat(robot_quat, future_steps, axis=0)
     robot_anchor_quat_w_exp = np.repeat(robot_anchor_quat_w_exp, len(body_names), axis=1)
 
     pos_b, _ = subtract_frame_transforms(
@@ -1160,10 +1219,11 @@ def motion_body_pos_b_future(sim_data, motion_loader, t, body_names):
     return np.array(pos_b, dtype=np.float32).reshape(-1)
 
 
-def motion_body_ori_b_future(sim_data, motion_loader, t, body_names):
+def motion_body_ori_b_future(sim_data, motion_loader, t, body_names, future_steps=None):
     """Future N-step reference body orientations in robot anchor frame, as 6D rotation."""
+    future_steps = motion_loader.future_steps if future_steps is None else int(future_steps)
     if t < 0:
-        return np.zeros(motion_loader.future_steps * len(body_names) * 6, dtype=np.float32)
+        return np.zeros(future_steps * len(body_names) * 6, dtype=np.float32)
 
     robot_pos = sim_data.body(motion_loader.anchor_body_name).xpos.copy().reshape(1, 1, 3)
     robot_quat = sim_data.body(motion_loader.anchor_body_name).xquat.copy().reshape(1, 1, 4)
@@ -1171,16 +1231,16 @@ def motion_body_ori_b_future(sim_data, motion_loader, t, body_names):
 
     future_positions = []
     future_orientations = []
-    for i in range(motion_loader.future_steps):
+    for i in range(future_steps):
         step_idx = min(t + i, motion_loader.T - 1)
         future_positions.append(motion_loader.body_pos[step_idx, body_indexes])
         future_orientations.append(motion_loader.body_ori[step_idx, body_indexes])
 
     future_body_pos_w = np.stack(future_positions, axis=0)
     future_body_quat_w = np.stack(future_orientations, axis=0)
-    robot_anchor_pos_w_exp = np.repeat(robot_pos, motion_loader.future_steps, axis=0)
+    robot_anchor_pos_w_exp = np.repeat(robot_pos, future_steps, axis=0)
     robot_anchor_pos_w_exp = np.repeat(robot_anchor_pos_w_exp, len(body_names), axis=1)
-    robot_anchor_quat_w_exp = np.repeat(robot_quat, motion_loader.future_steps, axis=0)
+    robot_anchor_quat_w_exp = np.repeat(robot_quat, future_steps, axis=0)
     robot_anchor_quat_w_exp = np.repeat(robot_anchor_quat_w_exp, len(body_names), axis=1)
 
     _, ori_b = subtract_frame_transforms(
@@ -1193,8 +1253,10 @@ def motion_body_ori_b_future(sim_data, motion_loader, t, body_names):
     return np.array(mat[..., :2].reshape(-1), dtype=np.float32)
 
 
-def robot_body_pos_b(sim_data, motion_loader, t):
+def robot_body_pos_b(sim_data, motion_loader, t, body_names=None):
     """Robot body positions in body frame"""
+    selected_body_names = body_names or motion_loader.body_names
+
     # Get robot anchor pose
     robot_anchor_pos = sim_data.body(motion_loader.anchor_body_name).xpos.copy().reshape(1, 3)
     robot_anchor_quat = sim_data.body(motion_loader.anchor_body_name).xquat.copy().reshape(1, 4)
@@ -1203,7 +1265,7 @@ def robot_body_pos_b(sim_data, motion_loader, t):
     robot_body_positions = []
     robot_body_orientations = []
 
-    for body_name in motion_loader.body_names:
+    for body_name in selected_body_names:
         body_pos = sim_data.body(body_name).xpos.copy().reshape(1, 3)
         body_quat = sim_data.body(body_name).xquat.copy().reshape(1, 4)
         robot_body_positions.append(body_pos)
@@ -1213,8 +1275,8 @@ def robot_body_pos_b(sim_data, motion_loader, t):
     robot_body_quat = np.concatenate(robot_body_orientations, axis=0)  # [14, 4]
 
     # Transform to body frame - expand robot_anchor to match robot_body shape
-    robot_anchor_pos_expanded = robot_anchor_pos.repeat(len(motion_loader.body_names), axis=0)  # [14, 3]
-    robot_anchor_quat_expanded = robot_anchor_quat.repeat(len(motion_loader.body_names), axis=0)  # [14, 4]
+    robot_anchor_pos_expanded = robot_anchor_pos.repeat(len(selected_body_names), axis=0)  # [N, 3]
+    robot_anchor_quat_expanded = robot_anchor_quat.repeat(len(selected_body_names), axis=0)  # [N, 4]
 
     pos_b, _ = subtract_frame_transforms(
         torch.from_numpy(robot_anchor_pos_expanded).float(),
@@ -1226,8 +1288,10 @@ def robot_body_pos_b(sim_data, motion_loader, t):
     return np.array(pos_b, dtype=np.float32).flatten()  # [42]
 
 
-def robot_body_ori_b(sim_data, motion_loader, t):
+def robot_body_ori_b(sim_data, motion_loader, t, body_names=None):
     """Robot body orientations in body frame"""
+    selected_body_names = body_names or motion_loader.body_names
+
     # Get robot anchor pose
     robot_anchor_pos = sim_data.body(motion_loader.anchor_body_name).xpos.copy().reshape(1, 3)
     robot_anchor_quat = sim_data.body(motion_loader.anchor_body_name).xquat.copy().reshape(1, 4)
@@ -1236,7 +1300,7 @@ def robot_body_ori_b(sim_data, motion_loader, t):
     robot_body_positions = []
     robot_body_orientations = []
 
-    for body_name in motion_loader.body_names:
+    for body_name in selected_body_names:
         body_pos = sim_data.body(body_name).xpos.copy().reshape(1, 3)
         body_quat = sim_data.body(body_name).xquat.copy().reshape(1, 4)
         robot_body_positions.append(body_pos)
@@ -1246,8 +1310,8 @@ def robot_body_ori_b(sim_data, motion_loader, t):
     robot_body_quat = np.concatenate(robot_body_orientations, axis=0)  # [14, 4]
 
     # Transform to body frame - expand robot_anchor to match robot_body shape
-    robot_anchor_pos_expanded = robot_anchor_pos.repeat(len(motion_loader.body_names), axis=0)  # [14, 3]
-    robot_anchor_quat_expanded = robot_anchor_quat.repeat(len(motion_loader.body_names), axis=0)  # [14, 4]
+    robot_anchor_pos_expanded = robot_anchor_pos.repeat(len(selected_body_names), axis=0)  # [N, 3]
+    robot_anchor_quat_expanded = robot_anchor_quat.repeat(len(selected_body_names), axis=0)  # [N, 4]
 
     _, ori_b = subtract_frame_transforms(
         torch.from_numpy(robot_anchor_pos_expanded).float(),
@@ -1329,22 +1393,36 @@ def get_projected_gravity(sim_data):
 #
 
 
-def compute_observation_term(term, sim_data, motion_loader, t, last_actions):
+def _future_steps_for_term(task, term, motion_loader):
+    if task in ONE_STEP_FUTURE_TASKS and term in FUTURE_TERM_DIMS:
+        return 1
+    return motion_loader.future_steps
+
+
+def compute_observation_term(term, sim_data, motion_loader, t, last_actions, task=None):
     """Compute one policy observation term in Isaac Lab policy order."""
     if term == "command":
         return get_command(motion_loader, t)
     if term == "motion_anchor_pos_b":
-        return motion_anchor_pos_b_future(sim_data, motion_loader, t)
+        return motion_anchor_pos_b_future(sim_data, motion_loader, t, _future_steps_for_term(task, term, motion_loader))
     if term == "motion_anchor_ori_b":
-        return motion_anchor_ori_b_future(sim_data, motion_loader, t)
+        return motion_anchor_ori_b_future(sim_data, motion_loader, t, _future_steps_for_term(task, term, motion_loader))
     if term == "robot_anchor_pos_w":
         return robot_anchor_pos_w(sim_data, motion_loader)
     if term == "robot_anchor_ori_w":
         return robot_anchor_ori_w(sim_data, motion_loader)
     if term == "motion_ee_pos_b":
-        return motion_body_pos_b_future(sim_data, motion_loader, t, DEFAULT_EE_BODY_NAMES)
+        return motion_body_pos_b_future(
+            sim_data, motion_loader, t, DEFAULT_EE_BODY_NAMES, _future_steps_for_term(task, term, motion_loader)
+        )
     if term == "motion_ee_ori_b":
-        return motion_body_ori_b_future(sim_data, motion_loader, t, DEFAULT_EE_BODY_NAMES)
+        return motion_body_ori_b_future(
+            sim_data, motion_loader, t, DEFAULT_EE_BODY_NAMES, _future_steps_for_term(task, term, motion_loader)
+        )
+    if term == "robot_ee_pos_b":
+        return robot_body_pos_b(sim_data, motion_loader, t, DEFAULT_EE_BODY_NAMES)
+    if term == "robot_ee_ori_b":
+        return robot_body_ori_b(sim_data, motion_loader, t, DEFAULT_EE_BODY_NAMES)
     if term == "projected_gravity":
         return get_projected_gravity(sim_data)
     if term == "base_lin_vel":
@@ -1377,7 +1455,10 @@ def compute_observation(
         return np.zeros(obs_dim, dtype=np.float32)
 
     pieces = [
-        np.asarray(compute_observation_term(term, sim_data, motion_loader, t, last_actions), dtype=np.float32).reshape(-1)
+        np.asarray(
+            compute_observation_term(term, sim_data, motion_loader, t, last_actions, task=task),
+            dtype=np.float32,
+        ).reshape(-1)
         for term in terms
     ]
     obs = np.concatenate(pieces, axis=0).astype(np.float32, copy=False)
@@ -1521,7 +1602,12 @@ if __name__ == "__main__":
             encoder_onnx_path=args.motion_ae_encoder_onnx_path,
             batch_size=args.motion_ae_batch_size,
         )
-    elif task in (TASK_PROJ_GRAV_ANCHOR_OBS_TRANSFORMER_VAE, TASK_PROJ_GRAV_ANCHOR_EE_OBS_TRANSFORMER_VAE):
+    elif task in (
+        TASK_PROJ_GRAV_ANCHOR_OBS_TRANSFORMER_VAE,
+        TASK_PROJ_GRAV_ANCHOR_EE_OBS_TRANSFORMER_VAE,
+        TASK_PROJ_GRAV_ANCHOR_EE_OBS_ONESTEP_TRANSFORMER_VAE,
+        TASK_PROJ_GRAV_ANCHOR_EE_REL_OBS_ONESTEP_TRANSFORMER_VAE,
+    ):
         motion_transformer_vae_adapter = MotionTransformerVAEOnnxLatentAdapter(
             project_root=args.motion_transformer_vae_project_root,
             config_path=args.motion_transformer_vae_config_path,

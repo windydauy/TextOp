@@ -5,6 +5,7 @@ from textop_tracker.tasks.tracking.config.g1.agents.rsl_rl_ppo_cfg import LOW_FR
 from textop_tracker.tasks.tracking.tracking_env_cfg import (
     NoisePrivObservationsCfg,
     PrivPrivObservationsCfg,
+    ProjGravAnchorEERelObsOneStepFutureObservationsCfg,
     ProjGravAnchorEEObsObservationsCfg,
     ProjGravAnchorEEObsOneStepFutureObservationsCfg,
     ProjGravAnchorEEObsSplitBodyTransformerVAERewardsCfg,
@@ -207,8 +208,24 @@ class G1FlatProjGravAnchorEEObsDirectRefMotionEnvCfg(G1FlatProjGravAnchorEEObsTr
 
 
 @configclass
+class G1FlatProjGravAnchorEEObsOneStepDirectRefMotionEnvCfg(G1FlatProjGravAnchorEEObsDirectRefMotionEnvCfg):
+    """One-step EEObs tracker with direct reference-motion commands."""
+
+    observations: ProjGravAnchorEEObsOneStepFutureObservationsCfg = ProjGravAnchorEEObsOneStepFutureObservationsCfg()
+
+
+@configclass
 class G1FlatProjGravAnchorEEObsOneStepTransformerVAEEnvCfg(G1FlatProjGravAnchorEEObsTransformerVAEEnvCfg):
     observations: ProjGravAnchorEEObsOneStepFutureObservationsCfg = ProjGravAnchorEEObsOneStepFutureObservationsCfg()
+
+
+@configclass
+class G1FlatProjGravAnchorEERelObsOneStepTransformerVAEEnvCfg(G1FlatProjGravAnchorEEObsOneStepTransformerVAEEnvCfg):
+    """One-step TransformerVAE task with deployable actor anchor/EE relative observations."""
+
+    observations: ProjGravAnchorEERelObsOneStepFutureObservationsCfg = (
+        ProjGravAnchorEERelObsOneStepFutureObservationsCfg()
+    )
 
 
 @configclass
